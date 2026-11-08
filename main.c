@@ -3,6 +3,7 @@
 #include <pspdisplay.h>
 #include <pspctrl.h>
 #include <stdint.h>
+#include <stdio.h>
 
 PSP_MODULE_INFO("JojoFighter", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
@@ -17,12 +18,24 @@ PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 static uint32_t *vram = (uint32_t *)0x44000000;
 static int ox = 0, oy = 0;   /* screen shake offset */
 
-/* character stats: 0 = Brawler, 1 = Speedster */
-static const int cspd[2]  = {3, 4};
-static const int cpun[2]  = {10, 8};
-static const int ckick[2] = {15, 12};
-static const int cjmp[2]  = {12, 14};
-static const uint32_t ccol[2] = {0xFF30A0E0, 0xFF3030C0};
+/* characters: 0 = Brawler, 1 = Speedster, 2 = Heavy */
+static const int cspd[3]  = {3, 4, 2};
+static const int cpun[3]  = {10, 8, 14};
+static const int ckick[3] = {15, 12, 20};
+static const int cjmp[3]  = {12, 14, 10};
+static const uint32_t ccol[3] = {0xFF30A0E0, 0xFF3030C0, 0xFF40C030};
+static const char *cname[3] = {"BRAWLER", "SPEEDSTER", "HEAVY"};
+static const char *cdesc[3] = {"BALANCED", "FAST + JUMPY", "SLOW + STRONG"};
+static const int cfx[3] = {80, 220, 360};
+
+/* difficulty: 0 easy, 1 normal, 2 hard */
+static const int espdv[3] = {1, 2, 3};
+static const int ecdb[3]  = {70, 40, 22};
+static const int ecdr[3]  = {40, 40, 20};
+static const int eblk[3]  = {40, 20, 10};
+static const int edmg[3]  = {70, 100, 120};
+static const char *lvname[3] = {"EASY", "NORMAL", "HARD"};
+static const uint32_t lvcol[3] = {0xFF30FF30, 0xFF00E0FF, 0xFF3030FF};
 
 static int exit_cb(int a, int b, void *c) { sceKernelExitGame(); return 0; }
 static int cb_thread(SceSize args, void *argp) {
@@ -188,7 +201,7 @@ static void draw_stage(int frame) {
     rect(0, GROUND, W, 3, 0xFF307030);
 }
 
-/* atk: 0 none, 1 punch, 2 kick. style: 0 brawler, 1 speedster, 2 stand */
+/* atk: 0 none, 1 punch, 2 kick. style: 0 brawler, 1 speedster, 2 heavy, 3 stand */
 static void draw_fighter(int x, int y, int face, uint32_t col,
                          int atk, int block, int walk, int frame, int style) {
     int cx = x + 20;
@@ -220,7 +233,7 @@ static void draw_fighter(int x, int y, int face, uint32_t col,
     line(cx, y + 50, l2x, l2y, 4, col);
 
     /* ---- details ---- */
-    if (style == 2) {
+    if (style == 3) {
         rect(cx - 8, y - 6, 4, 8, 0xFFFFFF80);
         rect(cx + 4, y - 6, 4, 8, 0xFFFFFF80);
         disc(cx, y + 32, 3, 0xFF00FFFF);
@@ -243,7 +256,7 @@ static void draw_fighter(int x, int y, int face, uint32_t col,
         /* boots */
         rect(l1x - 3, l1y - 2, 7, 4, 0xFFF0F0F0);
         rect(l2x - 3, l2y - 2, 7, 4, 0xFFF0F0F0);
-    } else {
+    } else if (style == 1) {
         /* spiky hair */
         rect(cx - 9, y - 5, 4, 8, 0xFF30D0FF);
         rect(cx - 3, y - 9, 5, 12, 0xFF30D0FF);
@@ -255,6 +268,14 @@ static void draw_fighter(int x, int y, int face, uint32_t col,
         /* boots */
         rect(l1x - 3, l1y - 2, 7, 4, 0xFF202020);
         rect(l2x - 3, l2y - 2, 7, 4, 0xFF202020);
+    } else {
+        /* heavy: thick torso, shoulder pads, mohawk, big belt */
+        line(cx, y + 22, cx, y + 48, 9, col);
+        rect(cx - 15, y + 22, 30, 6, 0xFF909090);
+        rect(cx - 2, y - 9, 5, 11, 0xFF2080FF);
+        rect(cx - 7, y + 46, 14, 4, 0xFF30D0FF);
+        rect(l1x - 4, l1y - 2, 9, 5, 0xFF303030);
+        rect(l2x - 4, l2y - 2, 9, 5, 0xFF303030);
     }
 }
 
@@ -275,6 +296,8 @@ int main(void) {
 
     int state = 0;        /* 0 title, 1 fight, 2 match over */
     int pc = 0, ec = 1;   /* chosen characters */
+    int lvl = 1;          /* difficulty */
+    int training = 0;
     int newround = 1;
     int matchwon = 0, mt = 0;
 
@@ -293,7 +316,7 @@ int main(void) {
     int pcombo = 0, pcc = 0, ecombo = 0, ecc = 0;
     int shake = 0, rtime = ROUNDTIME;
     int frame = 0;
-    char buf[24];
+    char buf[32];
     SceCtrlData pad;
     unsigned int prev = 0;
 
@@ -305,10 +328,13 @@ int main(void) {
 
         /* ================= TITLE ================= */
         if (state == 0) {
-            if (pressed & PSP_CTRL_LEFT)  pc = 0;
-            if (pressed & PSP_CTRL_RIGHT) pc = 1;
+            if ((pressed & PSP_CTRL_LEFT)  && pc > 0) pc--;
+            if ((pressed & PSP_CTRL_RIGHT) && pc < 2) pc++;
+            if ((pressed & PSP_CTRL_UP)    && lvl < 2) lvl++;
+            if ((pressed & PSP_CTRL_DOWN)  && lvl > 0) lvl--;
+            if (pressed & PSP_CTRL_SQUARE) training = !training;
             if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_START)) {
-                ec = pc ^ 1;
+                ec = (pc + 1 + (frame & 1)) % 3;
                 pwins = 0; ewins = 0;
                 newround = 1;
                 state = 1;
@@ -316,16 +342,26 @@ int main(void) {
 
             ox = 0; oy = 0;
             draw_stage(frame);
-            rect(0, 18, W, 40, 0xFF000000);
+            rect(0, 14, W, 76, 0xFF000000);
             textx(240, 3, 0xFF00E0FF, "JOJO FIGHTER");
             textx(240, 5, 0xFFFFFFFF, "CHOOSE YOUR FIGHTER");
 
-            draw_fighter(120, GROUND - 80, 1, ccol[0], 0, 0, pc == 0, frame, 0);
-            draw_fighter(320, GROUND - 80, -1, ccol[1], 0, 0, pc == 1, frame, 1);
+            sprintf(buf, "MODE: %s", training ? "TRAINING" : "VS CPU");
+            textx(240, 7, training ? 0xFF30FF30 : 0xFFFFFFFF, buf);
+            sprintf(buf, "LEVEL: %s", lvname[lvl]);
+            textx(240, 8, lvcol[lvl], buf);
+            if ((frame / 30) % 2 == 0)
+                textx(240, 9, 0xFF30FF30, "PRESS X TO START");
+
+            for (int i = 0; i < 3; i++) {
+                draw_fighter(cfx[i], GROUND - 80, 1, ccol[i], 0, 0, pc == i, frame, i);
+                textx(cfx[i] + 20, 29, 0xFFFFFFFF, cname[i]);
+                textx(cfx[i] + 20, 30, 0xFFB0B0B0, cdesc[i]);
+            }
 
             /* selection box */
             {
-                int sx = (pc == 0) ? 105 : 305;
+                int sx = cfx[pc] - 15;
                 uint32_t sc = 0xFF00E0FF;
                 rect(sx, GROUND - 105, 70, 3, sc);
                 rect(sx, GROUND + 4, 70, 3, sc);
@@ -333,23 +369,19 @@ int main(void) {
                 rect(sx + 67, GROUND - 105, 3, 112, sc);
             }
 
-            textx(140, 29, 0xFFFFFFFF, "BRAWLER");
-            textx(140, 30, 0xFFB0B0B0, "STRONG HITS");
-            textx(340, 29, 0xFFFFFFFF, "SPEEDSTER");
-            textx(340, 30, 0xFFB0B0B0, "FAST + JUMPY");
+            textx(240, 32, 0xFFD0D0D0, "UP/DOWN: LEVEL   SQUARE: TRAINING");
             textx(240, 33, 0xFFD0D0D0, "SQ PUNCH  TRI KICK  O BLOCK  R STAND");
-
-            if ((frame / 30) % 2 == 0)
-                textx(240, 4, 0xFF30FF30, "PRESS X TO START");
         }
 
         /* ================= FIGHT ================= */
         else if (state == 1) {
 
+            if (training && (pressed & PSP_CTRL_START)) state = 0;
+
             if (newround) {
                 newround = 0;
                 px = 100; py = GROUND - 80; vy = 0; pface = 1;
-                php = MAXHP; pflash = 0; pmeter = 0;
+                php = MAXHP; pflash = 0; pmeter = training ? 100 : 0;
                 patk = 0; pt = 0; phit = 0; psp = 0; pblock = 0; pwalk = 0;
                 ex = 340; eface = -1; ehp = MAXHP; eflash = 0; emeter = 0;
                 epunch = 0; ecd = 60; ehit = 0; eblock = 0; ebcd = 0; ewalk = 0; esp = 0;
@@ -435,76 +467,84 @@ int main(void) {
                     psp--;
                 }
 
-                /* enemy AI */
-                int exprev = ex;
-                int dx = px - ex;
-                int dist = dx < 0 ? -dx : dx;
-                eface = (dx >= 0) ? 1 : -1;
-                if (ecd > 0) ecd--;
-                if (ebcd > 0) ebcd--;
-                if (eblock > 0) eblock--;
+                /* ---------- enemy ---------- */
+                if (training) {
+                    /* passive dummy */
+                    eface = (px >= ex) ? 1 : -1;
+                    ewalk = 0; epunch = 0; esp = 0; eblock = 0;
+                } else {
+                    int exprev = ex;
+                    int dx = px - ex;
+                    int dist = dx < 0 ? -dx : dx;
+                    eface = (dx >= 0) ? 1 : -1;
+                    if (ecd > 0) ecd--;
+                    if (ebcd > 0) ebcd--;
+                    if (eblock > 0) eblock--;
 
-                if ((patk > 0 || psp > 0) && dist < 110 && eblock == 0 && ebcd == 0 &&
-                    epunch == 0 && esp == 0) {
-                    if (rnd() % 20 == 0) { eblock = 25; ebcd = 90; }
-                }
-
-                if (esp == 0 && epunch == 0 && eblock == 0 && emeter >= 100 && dist < 100) {
-                    esp = 45; emeter = 0;
-                }
-
-                if (epunch == 0 && eblock == 0 && esp == 0) {
-                    if (dist > 60) {
-                        ex += eface * 2;
-                    } else if (ecd > 0 && dist < 45) {
-                        ex -= eface;
-                    } else if (ecd == 0) {
-                        epunch = 14; ehit = 0;
-                        ecd = 40 + (rnd() % 40);
+                    if ((patk > 0 || psp > 0) && dist < 110 && eblock == 0 && ebcd == 0 &&
+                        epunch == 0 && esp == 0) {
+                        if (rnd() % eblk[lvl] == 0) { eblock = 25; ebcd = 90; }
                     }
-                }
-                ex = clampx(ex);
-                ewalk = (ex != exprev);
 
-                /* enemy punch */
-                if (epunch > 0) {
-                    int fx = (eface == 1) ? ex + 40 : ex - 30;
-                    int fy = GROUND - 60;
-                    if (!ehit && overlap(fx, fy, 30, 15, px, py, 40, 80)) {
-                        ehit = 1;
-                        if (pblock && pface == -eface) {
-                            php -= 2; pmeter += 3; emeter += 2;
-                            add_spark((pface == 1) ? px + 44 : px - 4, fy + 7, 2);
-                            shake = 2;
-                        } else {
-                            php -= cpun[ec]; pflash = 6; pmeter += 8; emeter += 10;
-                            px = clampx(px + 15 * eface);
-                            add_spark(px + 20, fy + 7, 0);
-                            shake = 6;
-                            ecombo = (ecc > 0) ? ecombo + 1 : 1;
-                            ecc = 70; pcombo = 0; pcc = 0;
+                    if (esp == 0 && epunch == 0 && eblock == 0 && emeter >= 100 && dist < 100) {
+                        esp = 45; emeter = 0;
+                    }
+
+                    if (epunch == 0 && eblock == 0 && esp == 0) {
+                        if (dist > 60) {
+                            ex += eface * espdv[lvl];
+                        } else if (ecd > 0 && dist < 45) {
+                            ex -= eface;
+                        } else if (ecd == 0) {
+                            epunch = 14; ehit = 0;
+                            ecd = ecdb[lvl] + (rnd() % ecdr[lvl]);
                         }
                     }
-                    epunch--;
-                }
+                    ex = clampx(ex);
+                    ewalk = (ex != exprev);
 
-                /* enemy Stand rush */
-                if (esp > 0) {
-                    int ax = (eface == 1) ? ex + 40 : ex - 80;
-                    if (esp % 6 == 0 && overlap(ax, GROUND - 80, 80, 80, px, py, 40, 80)) {
-                        if (pblock && pface == -eface) {
-                            php -= 1;
-                            add_spark((pface == 1) ? px + 44 : px - 4, py + 20 + rnd() % 40, 2);
-                        } else {
-                            php -= 4; pflash = 4;
-                            px = clampx(px + 4 * eface);
-                            add_spark(px + 20, py + 15 + rnd() % 50, 0);
-                            shake = 4;
-                            ecombo = (ecc > 0) ? ecombo + 1 : 1;
-                            ecc = 70; pcombo = 0; pcc = 0;
+                    /* enemy punch */
+                    if (epunch > 0) {
+                        int fx = (eface == 1) ? ex + 40 : ex - 30;
+                        int fy = GROUND - 60;
+                        if (!ehit && overlap(fx, fy, 30, 15, px, py, 40, 80)) {
+                            ehit = 1;
+                            if (pblock && pface == -eface) {
+                                php -= 2; pmeter += 3; emeter += 2;
+                                add_spark((pface == 1) ? px + 44 : px - 4, fy + 7, 2);
+                                shake = 2;
+                            } else {
+                                php -= cpun[ec] * edmg[lvl] / 100;
+                                pflash = 6; pmeter += 8; emeter += 10;
+                                px = clampx(px + 15 * eface);
+                                add_spark(px + 20, fy + 7, 0);
+                                shake = 6;
+                                ecombo = (ecc > 0) ? ecombo + 1 : 1;
+                                ecc = 70; pcombo = 0; pcc = 0;
+                            }
                         }
+                        epunch--;
                     }
-                    esp--;
+
+                    /* enemy Stand rush */
+                    if (esp > 0) {
+                        int ax = (eface == 1) ? ex + 40 : ex - 80;
+                        if (esp % 6 == 0 && overlap(ax, GROUND - 80, 80, 80, px, py, 40, 80)) {
+                            if (pblock && pface == -eface) {
+                                php -= 1;
+                                add_spark((pface == 1) ? px + 44 : px - 4, py + 20 + rnd() % 40, 2);
+                            } else {
+                                php -= (4 * edmg[lvl] + 50) / 100;
+                                pflash = 4;
+                                px = clampx(px + 4 * eface);
+                                add_spark(px + 20, py + 15 + rnd() % 50, 0);
+                                shake = 4;
+                                ecombo = (ecc > 0) ? ecombo + 1 : 1;
+                                ecc = 70; pcombo = 0; pcc = 0;
+                            }
+                        }
+                        esp--;
+                    }
                 }
 
                 if (pmeter > 100) pmeter = 100;
@@ -512,8 +552,20 @@ int main(void) {
                 if (eflash > 0) eflash--;
                 if (pflash > 0) pflash--;
 
+                /* training: refill everything, no K.O. */
+                if (training) {
+                    rtime = ROUNDTIME;
+                    if (pcc == 0 && ecc == 0) {
+                        if (ehp < MAXHP) ehp++;
+                        if (php < MAXHP) php++;
+                    }
+                    if (ehp < 1) ehp = 1;
+                    if (php < 1) php = 1;
+                    if (pmeter < 100) pmeter++;
+                }
+
                 /* K.O. or time up */
-                if (php <= 0 || ehp <= 0 || rtime <= 0) {
+                if (!training && (php <= 0 || ehp <= 0 || rtime <= 0)) {
                     ko = 150;
                     timeup = (php > 0 && ehp > 0);
                     pwon = (ehp <= php);
@@ -556,7 +608,7 @@ int main(void) {
             } else {
                 if (psp > 0)
                     draw_fighter(px + pface * 35, py, pface, 0xFFE030A0,
-                                 ((psp / 3) % 2) ? 1 : 0, 0, 0, frame, 2);
+                                 ((psp / 3) % 2) ? 1 : 0, 0, 0, frame, 3);
                 draw_fighter(px, py, pface, pflash ? 0xFFFFFFFF : ccol[pc],
                              patk, pblock, pwalk, frame, pc);
                 if (pblock) rect((pface == 1) ? px + 40 : px - 8, py + 15, 8, 50, 0xFFFFE000);
@@ -570,7 +622,7 @@ int main(void) {
             } else {
                 if (esp > 0)
                     draw_fighter(ex + eface * 35, GROUND - 80, eface, 0xFF40E060,
-                                 ((esp / 3) % 2) ? 1 : 0, 0, 0, frame, 2);
+                                 ((esp / 3) % 2) ? 1 : 0, 0, 0, frame, 3);
                 draw_fighter(ex, GROUND - 80, eface, eflash ? 0xFFFFFFFF : ccol[ec],
                              epunch > 0 ? 1 : 0, eblock > 0, ewalk, frame, ec);
                 if (eblock > 0) rect((eface == 1) ? ex + 40 : ex - 8, GROUND - 65, 8, 50, 0xFFFFE000);
@@ -593,12 +645,15 @@ int main(void) {
             rect(W - 220, 28, 200, 8, 0xFF000000);
             rect(W - 220, 28, emeter * 2, 8, (emeter >= 100) ? 0xFF40E060 : 0xFF00D0FF);
 
-            /* round wins */
-            for (int i = 0; i < pwins && i < 2; i++) disc(26 + i * 14, 46, 4, 0xFF00E0FF);
-            for (int i = 0; i < ewins && i < 2; i++) disc(W - 26 - i * 14, 46, 4, 0xFF00E0FF);
+            if (training) {
+                textx(240, 4, 0xFF30FF30, "TRAINING");
+                textx(240, 5, 0xFFB0B0B0, "START: EXIT");
+            } else {
+                /* round wins */
+                for (int i = 0; i < pwins && i < 2; i++) disc(26 + i * 14, 46, 4, 0xFF00E0FF);
+                for (int i = 0; i < ewins && i < 2; i++) disc(W - 26 - i * 14, 46, 4, 0xFF00E0FF);
 
-            /* round timer */
-            {
+                /* round timer */
                 int secs = (rtime + 59) / 60;
                 buf[0] = '0' + secs / 10;
                 buf[1] = '0' + secs % 10;
