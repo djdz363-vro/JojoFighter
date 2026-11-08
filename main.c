@@ -1,11 +1,15 @@
 #include <pspkernel.h>
+#include <psputils.h>
 #include <pspdisplay.h>
 #include <pspctrl.h>
 #include <pspgu.h>
 #include <pspgum.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <math.h>
+#include <png.h>
 
 PSP_MODULE_INFO("JojoFighter", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
@@ -19,13 +23,15 @@ PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 #define MAXHP 125
 #define ROUNDTIME 3600   /* 60 seconds at 60 fps */
 
-static unsigned int __attribute__((aligned(64))) list[262144];
+static unsigned int __attribute__((aligned(64))) list[524288];
 
 typedef struct { uint32_t color; float x, y, z; } Vtx;
+typedef struct { float u, v; uint32_t color; float x, y, z; } TVtx;
 typedef struct { float x, y, z; } V3;
 
 #define VT3 (GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
 #define VT2 (GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D)
+#define VTT (GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
 
 static V3 v3(float x, float y, float z) { V3 r; r.x = x; r.y = y; r.z = z; return r; }
 
@@ -34,10 +40,11 @@ static const int cspd[3]  = {3, 4, 2};
 static const int cpun[3]  = {10, 8, 14};
 static const int ckick[3] = {15, 12, 20};
 static const int cjmp[3]  = {12, 14, 10};
-static const uint32_t ccol[3] = {0xFF30A0E0, 0xFF3030C0, 0xFF40C030};
 static const char *cname[3] = {"BRAWLER", "SPEEDSTER", "HEAVY"};
 static const char *cdesc[3] = {"BALANCED", "FAST + JUMPY", "SLOW + STRONG"};
 static const int cfx[3] = {80, 220, 360};
+static const uint32_t cskin[3] = {0xFF78ACE0, 0xFF96BEEC, 0xFF648CC8};
+static const uint32_t bootc[3] = {0xFFF0F0F0, 0xFF202020, 0xFF303030};
 
 /* difficulty: 0 easy, 1 normal, 2 hard */
 static const int espdv[3] = {1, 2, 3};
@@ -107,9 +114,282 @@ static int barw(int hp) {
 }
 
 /* =====================================================================
+   TEXTURES: 12 images, 64x64. Built in code, and replaced by PNG files
+   (head0.png ... stand.png) found next to EBOOT.PBP.
+   ===================================================================== */
+#define TEXSZ 64
+#define NTEX 12
+enum { T_HEAD0 = 0, T_BODY0 = 3, T_LEGS0 = 6, T_GROUND = 9, T_BUILD = 10, T_STAND = 11 };
+
+static uint32_t __attribute__((aligned(16))) texdata[NTEX][TEXSZ * TEXSZ];
+static const char *texname[NTEX] = {
+    "head0.png", "head1.png", "head2.png",
+    "body0.png", "body1.png", "body2.png",
+    "legs0.png", "legs1.png", "legs2.png",
+    "ground.png", "building.png", "stand.png"
+};
+static int ncustom = 0;
+static char basedir[160] = "";
+static int cur_tex = -2;
+
+static void bind_tex(int t) {
+    if (t == cur_tex) return;
+    cur_tex = t;
+    if (t < 0) { sceGuDisable(GU_TEXTURE_2D); return; }
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, TEXSZ, TEXSZ, TEXSZ, texdata[t]);
+    sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
+    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+}
+
+static unsigned int tseed = 777;
+static int trnd(void) {
+    tseed = tseed * 1664525u + 1013904223u;
+    return (int)((tseed >> 16) & 0xFFFF);
+}
+
+static uint32_t tpx(int r, int g, int b) {
+    if (r < 0) r = 0;
+    if (r > 255) r = 255;
+    if (g < 0) g = 0;
+    if (g > 255) g = 255;
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    return 0xFF000000u | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+}
+
+static uint32_t tadj(uint32_t c, int d) {
+    return tpx((int)(c & 255) + d, (int)((c >> 8) & 255) + d, (int)((c >> 16) & 255) + d);
+}
+
+static void tput(int t, int x, int y, uint32_t c) {
+    if (x < 0 || y < 0 || x >= TEXSZ || y >= TEXSZ) return;
+    texdata[t][y * TEXSZ + x] = c;
+}
+
+static void tfill(int t, int x, int y, int w, int h, uint32_t c) {
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            tput(t, x + i, y + j, c);
+}
+
+/* face texture: covers the FRONT HALF of the head.
+   Edges and the top are hair, so the back of the head looks right. */
+static void gen_head(int t, uint32_t skin, uint32_t hair, int kind) {
+    uint32_t white = tpx(240, 240, 240), dark = tpx(24, 18, 28);
+    for (int y = 0; y < TEXSZ; y++) {
+        for (int x = 0; x < TEXSZ; x++) {
+            uint32_t c = tadj(skin, trnd() % 9 - 4);
+            if (y < 16 || (y < 46 && (x < 7 || x > 56))) c = tadj(hair, trnd() % 13 - 6);
+            tput(t, x, y, c);
+        }
+    }
+    /* eyes */
+    tfill(t, 17, 29, 8, 5, white);
+    tfill(t, 39, 29, 8, 5, white);
+    tfill(t, 21, 30, 4, 4, dark);
+    tfill(t, 39, 30, 4, 4, dark);
+    /* nose */
+    tfill(t, 30, 36, 4, 5, tadj(skin, -30));
+    if (kind == 0) {            /* brawler: calm brows, smirk */
+        tfill(t, 16, 26, 10, 2, dark);
+        tfill(t, 38, 26, 10, 2, dark);
+        tfill(t, 27, 46, 10, 2, tpx(150, 50, 50));
+        tfill(t, 37, 45, 2, 1, tpx(150, 50, 50));
+    } else if (kind == 1) {     /* speedster: sharp brows, grin */
+        tfill(t, 16, 25, 5, 2, dark);
+        tfill(t, 21, 27, 5, 2, dark);
+        tfill(t, 43, 25, 5, 2, dark);
+        tfill(t, 38, 27, 5, 2, dark);
+        tfill(t, 26, 45, 12, 4, tpx(120, 30, 40));
+        tfill(t, 27, 45, 10, 1, white);
+    } else {                    /* heavy: thick brows, frown, scar */
+        tfill(t, 15, 24, 11, 3, dark);
+        tfill(t, 38, 24, 11, 3, dark);
+        tfill(t, 27, 47, 10, 2, dark);
+        tfill(t, 26, 48, 2, 1, dark);
+        tfill(t, 36, 48, 2, 1, dark);
+        tfill(t, 47, 34, 1, 9, tpx(170, 90, 80));
+    }
+}
+
+static void gen_body(int t, uint32_t base, uint32_t accent, int kind) {
+    for (int y = 0; y < TEXSZ; y++) {
+        for (int x = 0; x < TEXSZ; x++) {
+            uint32_t c = tadj(base, trnd() % 11 - 5);
+            if (((x + y) & 7) == 0) c = tadj(c, -8);
+            tput(t, x, y, c);
+        }
+    }
+    if (kind == 0) {            /* jacket: zipper, collar, hem, emblem */
+        tfill(t, 31, 0, 2, TEXSZ, tadj(base, -70));
+        for (int y = 2; y < TEXSZ; y += 4) tfill(t, 29, y, 6, 1, accent);
+        tfill(t, 0, 0, TEXSZ, 6, accent);
+        tfill(t, 0, 57, TEXSZ, 7, accent);
+        for (int dy = -6; dy <= 6; dy++) {
+            int w = 6 - (dy < 0 ? -dy : dy);
+            tfill(t, 44 - w, 24 + dy, w * 2 + 1, 1, accent);
+        }
+    } else if (kind == 1) {     /* racing stripes */
+        tfill(t, 25, 0, 3, TEXSZ, accent);
+        tfill(t, 36, 0, 3, TEXSZ, accent);
+        tfill(t, 0, 0, TEXSZ, 4, accent);
+        tfill(t, 0, 60, TEXSZ, 4, accent);
+    } else {                    /* armor plates with rivets */
+        for (int y = 0; y < TEXSZ; y++) {
+            for (int x = 0; x < TEXSZ; x++) {
+                if (x % 16 == 0 || y % 16 == 0) tput(t, x, y, tadj(base, -60));
+                else if (x % 16 == 1 || y % 16 == 1) tput(t, x, y, tadj(base, 25));
+            }
+        }
+        for (int gy = 0; gy < 4; gy++)
+            for (int gx = 0; gx < 4; gx++)
+                tfill(t, gx * 16 + 6, gy * 16 + 6, 3, 3, accent);
+    }
+}
+
+static void gen_legs(int t, uint32_t base, uint32_t accent) {
+    for (int y = 0; y < TEXSZ; y++)
+        for (int x = 0; x < TEXSZ; x++)
+            tput(t, x, y, tadj(base, trnd() % 9 - 4));
+    tfill(t, 0, 0, 2, TEXSZ, tadj(base, -35));
+    tfill(t, 32, 0, 1, TEXSZ, tadj(base, -25));
+    tfill(t, 0, 24, TEXSZ, 6, tadj(base, -20));
+    tfill(t, 0, 44, TEXSZ, 2, tadj(accent, -30));
+    tfill(t, 0, 50, TEXSZ, 14, accent);
+}
+
+static void gen_ground(int t) {
+    for (int y = 0; y < TEXSZ; y++) {
+        for (int x = 0; x < TEXSZ; x++) {
+            uint32_t c = tpx(30, 90, 40);
+            c = tadj(c, trnd() % 17 - 8);
+            if (((x / 32) + (y / 32)) & 1) c = tadj(c, -10);
+            if (x % 32 == 0 || y % 32 == 0) c = tpx(70, 140, 70);
+            tput(t, x, y, c);
+        }
+    }
+    for (int i = 0; i < 40; i++) tput(t, trnd() % TEXSZ, trnd() % TEXSZ, tpx(90, 160, 80));
+}
+
+static void gen_build(int t) {
+    for (int y = 0; y < TEXSZ; y++)
+        for (int x = 0; x < TEXSZ; x++)
+            tput(t, x, y, tadj(tpx(14, 10, 20), trnd() % 5 - 2));
+    for (int r = 0; r < 8; r++) {
+        for (int c = 0; c < 4; c++) {
+            int lit = (trnd() % 100) < 42;
+            uint32_t wc = lit ? tpx(240, 200, 64) : tpx(26, 28, 44);
+            tfill(t, 4 + c * 15, 3 + r * 8, 8, 5, wc);
+            if (lit) tfill(t, 6 + c * 15, 4 + r * 8, 4, 2, tpx(255, 235, 140));
+        }
+    }
+}
+
+static void gen_stand(int t) {
+    for (int y = 0; y < TEXSZ; y++) {
+        for (int x = 0; x < TEXSZ; x++) {
+            int v = ((x + y) / 5) & 1;
+            uint32_t c = v ? tpx(250, 250, 255) : tpx(205, 205, 225);
+            c = tadj(c, trnd() % 13 - 6);
+            if ((y % 16) < 2) c = tpx(255, 255, 255);
+            tput(t, x, y, c);
+        }
+    }
+}
+
+static void gen_all(void) {
+    gen_head(T_HEAD0 + 0, tpx(224, 172, 120), tpx(110, 70, 40), 0);
+    gen_head(T_HEAD0 + 1, tpx(236, 190, 150), tpx(250, 210, 60), 1);
+    gen_head(T_HEAD0 + 2, tpx(200, 140, 100), tpx(40, 30, 30), 2);
+    gen_body(T_BODY0 + 0, tpx(224, 160, 48), tpx(250, 250, 250), 0);
+    gen_body(T_BODY0 + 1, tpx(190, 40, 40), tpx(255, 255, 255), 1);
+    gen_body(T_BODY0 + 2, tpx(48, 170, 64), tpx(170, 170, 180), 2);
+    gen_legs(T_LEGS0 + 0, tpx(40, 60, 150), tpx(240, 240, 240));
+    gen_legs(T_LEGS0 + 1, tpx(40, 30, 40), tpx(200, 40, 40));
+    gen_legs(T_LEGS0 + 2, tpx(70, 80, 70), tpx(240, 130, 30));
+    gen_ground(T_GROUND);
+    gen_build(T_BUILD);
+    gen_stand(T_STAND);
+}
+
+/* ---------- PNG loading / saving (any PNG size is shrunk to 64x64) ---------- */
+static int load_png_at(int t, const char *path) {
+    png_image img;
+    memset(&img, 0, sizeof(img));
+    img.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_file(&img, path)) {
+        png_image_free(&img);
+        return 0;
+    }
+    img.format = PNG_FORMAT_RGBA;
+    if (img.width == 0 || img.height == 0 || img.width > 1024 || img.height > 1024) {
+        png_image_free(&img);
+        return 0;
+    }
+    size_t sz = PNG_IMAGE_SIZE(img);
+    uint8_t *buf = (uint8_t *)malloc(sz);
+    if (!buf) {
+        png_image_free(&img);
+        return 0;
+    }
+    if (!png_image_finish_read(&img, NULL, buf, 0, NULL)) {
+        free(buf);
+        png_image_free(&img);
+        return 0;
+    }
+    for (int y = 0; y < TEXSZ; y++) {
+        int sy = y * (int)img.height / TEXSZ;
+        for (int x = 0; x < TEXSZ; x++) {
+            int sx = x * (int)img.width / TEXSZ;
+            const uint8_t *p = buf + ((size_t)sy * img.width + sx) * 4;
+            texdata[t][y * TEXSZ + x] = 0xFF000000u | ((uint32_t)p[2] << 16) |
+                                        ((uint32_t)p[1] << 8) | (uint32_t)p[0];
+        }
+    }
+    free(buf);
+    png_image_free(&img);
+    return 1;
+}
+
+static int load_png(int t, const char *name) {
+    char path[220];
+    snprintf(path, sizeof(path), "%s%s", basedir, name);
+    if (load_png_at(t, path)) return 1;
+    snprintf(path, sizeof(path), "ms0:/PSP/GAME/JojoFighter/%s", name);
+    if (load_png_at(t, path)) return 1;
+    return load_png_at(t, name);
+}
+
+static int save_png_at(int t, const char *path) {
+    png_image img;
+    memset(&img, 0, sizeof(img));
+    img.version = PNG_IMAGE_VERSION;
+    img.width = TEXSZ;
+    img.height = TEXSZ;
+    img.format = PNG_FORMAT_RGBA;
+    return png_image_write_to_file(&img, path, 0, texdata[t], 0, NULL) ? 1 : 0;
+}
+
+static int export_all(void) {
+    int n = 0;
+    for (int t = 0; t < NTEX; t++) {
+        char path[220];
+        snprintf(path, sizeof(path), "%s%s", basedir, texname[t]);
+        if (save_png_at(t, path)) { n++; continue; }
+        snprintf(path, sizeof(path), "ms0:/PSP/GAME/JojoFighter/%s", texname[t]);
+        if (save_png_at(t, path)) n++;
+    }
+    return n;
+}
+
+/* =====================================================================
    2D drawing (screen pixels) - used for UI
    ===================================================================== */
 static void rect(int x, int y, int w, int h, uint32_t c) {
+    bind_tex(-1);
     Vtx *v = (Vtx *)sceGuGetMemory(2 * sizeof(Vtx));
     v[0].color = c; v[0].x = (float)x;       v[0].y = (float)y;       v[0].z = 0;
     v[1].color = c; v[1].x = (float)(x + w); v[1].y = (float)(y + h); v[1].z = 0;
@@ -117,6 +397,7 @@ static void rect(int x, int y, int w, int h, uint32_t c) {
 }
 
 static void disc(int cx, int cy, int r, uint32_t c) {
+    bind_tex(-1);
     int n = 24;
     Vtx *v = (Vtx *)sceGuGetMemory((n + 2) * sizeof(Vtx));
     v[0].color = c; v[0].x = (float)cx; v[0].y = (float)cy; v[0].z = 0;
@@ -134,6 +415,7 @@ static void line(int x0, int y0, int x1, int y1, int t, uint32_t c) {
     float dx = (float)(x1 - x0), dy = (float)(y1 - y0);
     float len = sqrtf(dx * dx + dy * dy);
     if (len < 0.001f) { rect(x0 - t / 2, y0 - t / 2, t, t, c); return; }
+    bind_tex(-1);
     float nx = -dy / len * t * 0.5f, ny = dx / len * t * 0.5f;
     Vtx *v = (Vtx *)sceGuGetMemory(4 * sizeof(Vtx));
     v[0].color = c; v[0].x = x0 + nx; v[0].y = y0 + ny; v[0].z = 0;
@@ -144,7 +426,7 @@ static void line(int x0, int y0, int x1, int y1, int t, uint32_t c) {
 }
 
 /* =====================================================================
-   Text: tiny 5x7 pixel font drawn by the GPU (no debug screen needed)
+   Text: tiny 5x7 pixel font drawn by the GPU
    ===================================================================== */
 static const char CS[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!+-.:/><()";
 static const unsigned char FONT[47][7] = {
@@ -198,6 +480,7 @@ static const unsigned char FONT[47][7] = {
 };
 
 static const unsigned char *glyph(char c) {
+    if (c >= 'a' && c <= 'z') c = (char)(c - 32);
     for (int i = 0; CS[i]; i++) if (CS[i] == c) return FONT[i];
     return FONT[0];
 }
@@ -231,6 +514,7 @@ static void textl(int col, int row, uint32_t color, const char *s) {
 
 static void flush_text(void) {
     if (ntx == 0) return;
+    bind_tex(-1);
     sceGuDisable(GU_DEPTH_TEST);
 
     int total = 0;
@@ -286,7 +570,9 @@ static void combo_str(char *buf, int n) {
    3D helpers
    World units: 1 unit = 20 old pixels. Ground is y = 0, fighters ~4 tall.
    ===================================================================== */
-static int g_flat = 0;   /* 1 = no shading */
+static int g_flat = 0;     /* 1 = no shading (boxes) */
+static int g_flash = 0;    /* 1 = hit flash: draw solid white, no texture */
+static uint32_t g_stand = 0xFFE030A0;   /* tint for Stand bodies */
 static V3 cam_eye, cam_ctr;
 
 static V3 wp(float px_, float py_, float z) {
@@ -301,6 +587,11 @@ static uint32_t shadec(uint32_t c, float f) {
     return 0xFF000000u | (b << 16) | (g << 8) | r;
 }
 
+static float lit(float nx, float ny, float nz) {
+    float d = nx * -0.348f + ny * 0.795f + nz * 0.497f;
+    return d < 0.0f ? 0.0f : d;
+}
+
 #define PV(P) do { v[k].color = col; v[k].x = (P)->x; v[k].y = (P)->y; v[k].z = (P)->z; k++; } while (0)
 
 /* c[0..3] = one end, c[4..7] = other end */
@@ -310,6 +601,7 @@ static void prism(const V3 *c, uint32_t color) {
     for (int i = 0; i < 8; i++) { mx += c[i].x; my += c[i].y; mz += c[i].z; }
     mx /= 8; my /= 8; mz /= 8;
 
+    bind_tex(-1);
     Vtx *v = (Vtx *)sceGuGetMemory(36 * sizeof(Vtx));
     int k = 0;
     for (int f = 0; f < 6; f++) {
@@ -327,11 +619,7 @@ static void prism(const V3 *c, uint32_t color) {
         float qz = (a->z + cc->z) * 0.5f - mz;
         if (nx * qx + ny * qy + nz * qz < 0) { nx = -nx; ny = -ny; nz = -nz; }
         float sh = 1.0f;
-        if (!g_flat) {
-            float dp = nx * -0.348f + ny * 0.795f + nz * 0.497f;
-            if (dp < 0) dp = 0;
-            sh = 0.45f + 0.55f * dp;
-        }
+        if (!g_flat) sh = 0.45f + 0.55f * lit(nx, ny, nz);
         uint32_t col = shadec(color, sh);
         PV(a); PV(b); PV(cc);
         PV(a); PV(cc); PV(d);
@@ -378,12 +666,14 @@ static void quadxy(Vtx *v, int *k, float x0, float y0, float x1, float y1, float
     qv(v, k, x0, y0, z, c); qv(v, k, x1, y1, z, c); qv(v, k, x0, y1, z, c);
 }
 
-static void quadxz(Vtx *v, int *k, float x0, float z0, float x1, float z1, float y, uint32_t c) {
-    qv(v, k, x0, y, z0, c); qv(v, k, x1, y, z0, c); qv(v, k, x1, y, z1, c);
-    qv(v, k, x0, y, z0, c); qv(v, k, x1, y, z1, c); qv(v, k, x0, y, z1, c);
+static void tvx(TVtx *v, int *k, float u, float vv, uint32_t c, float x, float y, float z) {
+    v[*k].u = u; v[*k].v = vv; v[*k].color = c;
+    v[*k].x = x; v[*k].y = y; v[*k].z = z;
+    (*k)++;
 }
 
 static void disc3(float cx, float cy, float cz, float r, uint32_t c) {
+    bind_tex(-1);
     int n = 24;
     Vtx *v = (Vtx *)sceGuGetMemory((n + 2) * sizeof(Vtx));
     v[0].color = c; v[0].x = cx; v[0].y = cy; v[0].z = cz;
@@ -398,6 +688,7 @@ static void disc3(float cx, float cy, float cz, float r, uint32_t c) {
 }
 
 static void shadow(float wx, float height) {
+    bind_tex(-1);
     float s = 1.3f / (1.0f + height * 0.35f);
     uint32_t c = 0xFF0C200C;
     Vtx *v = (Vtx *)sceGuGetMemory(4 * sizeof(Vtx));
@@ -406,6 +697,94 @@ static void shadow(float wx, float height) {
     v[2].color = c; v[2].x = wx + s; v[2].y = 0.03f; v[2].z = -0.9f;
     v[3].color = c; v[3].x = wx - s; v[3].y = 0.03f; v[3].z = -0.9f;
     sceGuDrawArray(GU_TRIANGLE_FAN, VT3, 4, 0, v);
+}
+
+/* ---------- round shapes ---------- */
+#define MAXSEG 14
+#define MAXRING 8
+
+/* ellipsoid. Texture u runs over the FRONT HALF (the face side); yaw turns it. */
+static void ell(float cx, float cy, float cz, float rx, float ry, float rz, float yaw,
+                int tex, uint32_t col, int seg, int ring) {
+    static TVtx grid[(MAXRING + 1) * (MAXSEG + 1)];
+    float clat[MAXRING + 1], slat[MAXRING + 1], cp[MAXSEG + 1], sp[MAXSEG + 1];
+    if (seg > MAXSEG) seg = MAXSEG;
+    if (ring > MAXRING) ring = MAXRING;
+    int t = g_flash ? -1 : tex;
+    float yc = cosf(yaw), ys = sinf(yaw);
+
+    for (int i = 0; i <= ring; i++) {
+        float la = 1.5707963f - i * 3.1415927f / ring;
+        clat[i] = cosf(la); slat[i] = sinf(la);
+    }
+    for (int j = 0; j <= seg; j++) {
+        float pr = ((float)j / seg - 0.5f) * 6.2831853f;
+        cp[j] = cosf(pr); sp[j] = sinf(pr);
+    }
+    for (int i = 0; i <= ring; i++) {
+        for (int j = 0; j <= seg; j++) {
+            float pr = ((float)j / seg - 0.5f) * 6.2831853f;
+            float sa = sp[j] * yc + cp[j] * ys;
+            float ca = cp[j] * yc - sp[j] * ys;
+            float nx = clat[i] * sa, ny = slat[i], nz = clat[i] * ca;
+            float u = 0.5f + pr / 3.1415927f;
+            if (u < 0.0f) u = 0.0f;
+            if (u > 1.0f) u = 1.0f;
+            uint32_t c = g_flash ? 0xFFFFFFFF : shadec(col, 0.5f + 0.5f * lit(nx, ny, nz));
+            TVtx *g = &grid[i * (seg + 1) + j];
+            g->u = u; g->v = (float)i / ring; g->color = c;
+            g->x = cx + nx * rx; g->y = cy + ny * ry; g->z = cz + nz * rz;
+        }
+    }
+    int nv = seg * ring * 6;
+    TVtx *v = (TVtx *)sceGuGetMemory(nv * sizeof(TVtx));
+    int k = 0;
+    for (int i = 0; i < ring; i++) {
+        for (int j = 0; j < seg; j++) {
+            TVtx *a = &grid[i * (seg + 1) + j];
+            TVtx *b = &grid[i * (seg + 1) + j + 1];
+            TVtx *c2 = &grid[(i + 1) * (seg + 1) + j + 1];
+            TVtx *d = &grid[(i + 1) * (seg + 1) + j];
+            v[k++] = *a; v[k++] = *b; v[k++] = *c2;
+            v[k++] = *a; v[k++] = *c2; v[k++] = *d;
+        }
+    }
+    bind_tex(t);
+    sceGuDrawArray(GU_TRIANGLES, VTT, nv, 0, v);
+}
+
+/* 8-sided tapered tube from a to b (radius ra at a, rb at b). dz squashes depth. */
+static void tube(V3 a, V3 b, float ra, float rb, float dz, int tex, uint32_t col) {
+    static float tcs[9], tsn[9];
+    static int tinit = 0;
+    if (!tinit) {
+        for (int s = 0; s <= 8; s++) { tcs[s] = cosf(s * 0.7853982f); tsn[s] = sinf(s * 0.7853982f); }
+        tinit = 1;
+    }
+    float dx = b.x - a.x, dy = b.y - a.y;
+    float len = sqrtf(dx * dx + dy * dy);
+    float n1x = 1.0f, n1y = 0.0f;
+    if (len > 0.001f) { n1x = -dy / len; n1y = dx / len; }
+    int t = g_flash ? -1 : tex;
+    TVtx rg[2][9];
+    for (int s = 0; s <= 8; s++) {
+        float nx = tcs[s] * n1x, ny = tcs[s] * n1y, nz = tsn[s];
+        uint32_t c = g_flash ? 0xFFFFFFFF : shadec(col, 0.5f + 0.5f * lit(nx, ny, nz));
+        float u = s / 8.0f + 0.25f;
+        rg[0][s].u = u; rg[0][s].v = 0.0f; rg[0][s].color = c;
+        rg[0][s].x = a.x + nx * ra; rg[0][s].y = a.y + ny * ra; rg[0][s].z = a.z + nz * ra * dz;
+        rg[1][s].u = u; rg[1][s].v = 1.0f; rg[1][s].color = c;
+        rg[1][s].x = b.x + nx * rb; rg[1][s].y = b.y + ny * rb; rg[1][s].z = b.z + nz * rb * dz;
+    }
+    int nv = 48;
+    TVtx *v = (TVtx *)sceGuGetMemory(nv * sizeof(TVtx));
+    int k = 0;
+    for (int s = 0; s < 8; s++) {
+        v[k++] = rg[0][s]; v[k++] = rg[0][s + 1]; v[k++] = rg[1][s + 1];
+        v[k++] = rg[0][s]; v[k++] = rg[1][s + 1]; v[k++] = rg[1][s];
+    }
+    bind_tex(t);
+    sceGuDrawArray(GU_TRIANGLES, VTT, nv, 0, v);
 }
 
 static void set_camera(V3 eye, V3 ctr) {
@@ -422,7 +801,7 @@ static void set_camera(V3 eye, V3 ctr) {
     sceGumLookAt(&e, &c, &u);
     sceGumMatrixMode(GU_MODEL);
     sceGumLoadIdentity();
-    sceGumUpdateMatrix();   /* send the camera to the GPU (this was missing) */
+    sceGumUpdateMatrix();
 }
 
 /* world point -> screen pixel (for text placement) */
@@ -482,6 +861,8 @@ static void draw_sparks(void) {
 /* ---------- 3D stage ---------- */
 static void draw_stage(int frame) {
     g_flat = 0;
+    g_flash = 0;
+    bind_tex(-1);
 
     /* horizon glow */
     {
@@ -510,16 +891,24 @@ static void draw_stage(int frame) {
     disc3(20.0f, 24.0f, -50.0f, 4.5f, 0xFFC0F8FF);
     disc3(22.2f, 25.2f, -49.5f, 4.0f, 0xFF2A0C06);
 
-    /* ground stripes */
+    /* textured ground */
     {
-        Vtx *v = (Vtx *)sceGuGetMemory(16 * 6 * sizeof(Vtx));
+        TVtx *v = (TVtx *)sceGuGetMemory(16 * 6 * sizeof(TVtx));
         int k = 0;
         for (int i = 0; i < 16; i++) {
-            float x0 = -48.0f + i * 6.0f;
-            quadxz(v, &k, x0, -46.0f, x0 + 6.0f, 26.0f, 0.0f,
-                   (i & 1) ? 0xFF285028 : 0xFF204020);
+            float x0 = -48.0f + i * 6.0f, x1 = x0 + 6.0f;
+            float z0 = -46.0f, z1 = 26.0f;
+            uint32_t c = (i & 1) ? 0xFFE0E0E0 : 0xFFFFFFFF;
+            float u0 = x0 / 3.0f, u1 = x1 / 3.0f, v0 = z0 / 3.0f, v1 = z1 / 3.0f;
+            tvx(v, &k, u0, v0, c, x0, 0.0f, z0);
+            tvx(v, &k, u1, v0, c, x1, 0.0f, z0);
+            tvx(v, &k, u1, v1, c, x1, 0.0f, z1);
+            tvx(v, &k, u0, v0, c, x0, 0.0f, z0);
+            tvx(v, &k, u1, v1, c, x1, 0.0f, z1);
+            tvx(v, &k, u0, v1, c, x0, 0.0f, z1);
         }
-        sceGuDrawArray(GU_TRIANGLES, VT3, k, 0, v);
+        bind_tex(T_GROUND);
+        sceGuDrawArray(GU_TRIANGLES, VTT, k, 0, v);
     }
 
     /* skyline */
@@ -528,49 +917,53 @@ static void draw_stage(int frame) {
         float h = 6.0f + (float)((b * 37) % 11);
         box(x, h * 0.5f, -26.0f, 5.0f, h, 4.0f, 0xFF140804);
 
-        Vtx *v = (Vtx *)sceGuGetMemory(150 * sizeof(Vtx));
-        int n = 0;
-        for (float y = 1.5f; y < h - 1.0f; y += 2.0f) {
-            for (int c = 0; c < 3; c++) {
-                float wx = x - 1.5f + c * 1.5f;
-                if (((b * 7 + c * 3 + (int)y * 5) % 5) < 2 && n + 6 <= 150)
-                    quadxy(v, &n, wx - 0.3f, y - 0.35f, wx + 0.3f, y + 0.35f, -23.8f, 0xFF40C8F0);
-            }
-        }
-        if (n > 0) sceGuDrawArray(GU_TRIANGLES, VT3, n, 0, v);
+        TVtx *v = (TVtx *)sceGuGetMemory(6 * sizeof(TVtx));
+        int k = 0;
+        float v0 = b * 0.37f, v1 = v0 + (h - 0.6f) / 9.0f;
+        tvx(v, &k, 0.0f, v1, 0xFFFFFFFF, x - 2.5f, 0.6f, -23.9f);
+        tvx(v, &k, 1.0f, v1, 0xFFFFFFFF, x + 2.5f, 0.6f, -23.9f);
+        tvx(v, &k, 1.0f, v0, 0xFFFFFFFF, x + 2.5f, h,    -23.9f);
+        tvx(v, &k, 0.0f, v1, 0xFFFFFFFF, x - 2.5f, 0.6f, -23.9f);
+        tvx(v, &k, 1.0f, v0, 0xFFFFFFFF, x + 2.5f, h,    -23.9f);
+        tvx(v, &k, 0.0f, v0, 0xFFFFFFFF, x - 2.5f, h,    -23.9f);
+        bind_tex(T_BUILD);
+        sceGuDrawArray(GU_TRIANGLES, VTT, k, 0, v);
     }
+    bind_tex(-1);
 }
 
 /* =====================================================================
-   3D fighter
+   3D fighter (round shapes + textures)
    atk: 0 none, 1 light punch, 2 heavy punch, 3 light kick, 4 heavy kick
    style: 0 brawler, 1 speedster, 2 heavy, 3 stand
    ===================================================================== */
-static void draw_fighter(int x, int y, int face, uint32_t col,
-                         int atk, int block, int walk, int frame, int style, float z) {
+static void draw_fighter(int x, int y, int face, int flash, int atk, int block,
+                         int walk, int frame, int style, float z) {
     float cx = (float)x + 20.0f, ty = (float)y;
     int air = (y < GROUND - 80);
-    V3 p;
-    g_flat = (col == 0xFFFFFFFF);
+    int stand = (style == 3);
+    int ts = stand ? 0 : style;
+    int th = stand ? T_STAND : T_HEAD0 + ts;
+    int tb = stand ? T_STAND : T_BODY0 + ts;
+    int tl = stand ? T_STAND : T_LEGS0 + ts;
+    uint32_t tc = stand ? g_stand : 0xFFFFFFFF;
+    uint32_t skin = stand ? g_stand : cskin[ts];
+    uint32_t boot = stand ? g_stand : bootc[ts];
+    float yaw = face * 0.55f;
+    float big = (style == 2) ? 1.0f : 0.0f;
+    V3 p, hd;
+
+    g_flash = flash;
+    g_flat = flash;
 
 #define J(dx, dy) wp(cx + (float)(dx), ty + (float)(dy), z)
 
-    /* head + eye */
-    p = J(0, 10);
-    box(p.x, p.y, p.z, 1.0f, 1.0f, 1.0f, col);
-    {
-        int sf = g_flat;
-        g_flat = 1;
-        box(p.x + face * 0.22f, p.y + 0.1f, p.z + 0.53f, 0.26f, 0.26f, 0.1f, 0xFF00FFFF);
-        g_flat = sf;
-    }
+    /* head */
+    hd = J(0, 10);
+    ell(hd.x, hd.y, hd.z, 0.55f, 0.58f, 0.55f, yaw, th, tc, 14, 8);
 
     /* torso */
-    {
-        float tw = (style == 2) ? 1.3f : 0.7f;
-        float td = (style == 2) ? 0.9f : 0.55f;
-        limb(J(0, 20), J(0, 50), tw, td, col);
-    }
+    tube(J(0, 20), J(0, 50), 0.46f + 0.26f * big, 0.34f + 0.21f * big, 0.72f, tb, tc);
 
     /* arms */
     int fx, fy, bx, by;
@@ -578,8 +971,13 @@ static void draw_fighter(int x, int y, int face, uint32_t col,
     else if (atk == 2) { fx = face * 58; fy = 26; bx = -face * 16; by = 34; }
     else if (block)    { fx = face * 16; fy = 16; bx = face * 8;   by = 14; }
     else               { fx = face * 14; fy = 42; bx = -face * 12; by = 42; }
-    limb(J(0, 28), J(fx, fy), 0.36f, 0.36f, col);
-    limb(J(0, 28), J(bx, by), 0.36f, 0.36f, col);
+    {
+        float ar = 0.19f + 0.07f * big;
+        tube(J(0, 28), J(fx, fy), ar, ar * 0.8f, 1.0f, tb, tc);
+        tube(J(0, 28), J(bx, by), ar, ar * 0.8f, 1.0f, tb, tc);
+    }
+    p = J(fx, fy); ell(p.x, p.y, p.z, 0.21f, 0.21f, 0.21f, 0.0f, -1, skin, 6, 4);
+    p = J(bx, by); ell(p.x, p.y, p.z, 0.21f, 0.21f, 0.21f, 0.0f, -1, skin, 6, 4);
 
     /* legs */
     int l1x, l1y, l2x, l2y;
@@ -590,75 +988,86 @@ static void draw_fighter(int x, int y, int face, uint32_t col,
     else if (walk)     { l1x = spread; l1y = 80; l2x = -spread; l2y = 80; }
     else               { l1x = 8; l1y = 80; l2x = -8; l2y = 80; }
     {
-        float lt = (style == 2) ? 0.55f : 0.4f;
-        limb(J(0, 50), J(l1x, l1y), lt, lt, col);
-        limb(J(0, 50), J(l2x, l2y), lt, lt, col);
+        float lr = 0.24f + 0.08f * big;
+        tube(J(0, 50), J(l1x, l1y), lr, lr * 0.72f, 1.0f, tl, tc);
+        tube(J(0, 50), J(l2x, l2y), lr, lr * 0.72f, 1.0f, tl, tc);
     }
+    p = J(l1x + face * 4, l1y - 1);
+    ell(p.x, p.y, p.z, 0.34f + 0.06f * big, 0.17f, 0.26f, 0.0f, -1, boot, 8, 4);
+    p = J(l2x + face * 4, l2y - 1);
+    ell(p.x, p.y, p.z, 0.34f + 0.06f * big, 0.17f, 0.26f, 0.0f, -1, boot, 8, 4);
 
-    if (style == 3) {
-        /* Stand: horns + chest gem */
-        p = J(-6, -3); box(p.x, p.y, p.z, 0.2f, 0.45f, 0.25f, 0xFFFFFF80);
-        p = J(6, -3);  box(p.x, p.y, p.z, 0.2f, 0.45f, 0.25f, 0xFFFFFF80);
-        p = J(0, 32);
-        g_flat = 1;
-        box(p.x, p.y, p.z + 0.3f, 0.35f, 0.35f, 0.2f, 0xFF00FFFF);
-        g_flat = 0;
-        return;
-    }
-
-    /* hands */
-    p = J(fx, fy); box(p.x, p.y, p.z, 0.34f, 0.34f, 0.34f, 0xFFA0D0FF);
-    p = J(bx, by); box(p.x, p.y, p.z, 0.34f, 0.34f, 0.34f, 0xFFA0D0FF);
-
+    /* ---- extras ---- */
     if (style == 0) {
         /* cap + brim */
-        p = J(0, -1);        box(p.x, p.y, p.z, 1.1f, 0.35f, 1.1f, 0xFFF0F0F0);
-        p = J(face * 10, 3); box(p.x, p.y, p.z, 0.6f, 0.15f, 0.95f, 0xFFF0F0F0);
+        ell(hd.x, hd.y + 0.28f, hd.z, 0.62f, 0.36f, 0.62f, yaw, -1, 0xFFF0F0F0, 10, 6);
+        ell(hd.x + sinf(yaw) * 0.5f, hd.y + 0.15f, hd.z + cosf(yaw) * 0.5f,
+            0.40f, 0.06f, 0.40f, 0.0f, -1, 0xFFF0F0F0, 10, 4);
         /* scarf + fluttering tail */
-        p = J(0, 21);        box(p.x, p.y, p.z, 0.95f, 0.22f, 0.8f, 0xFF2020E0);
+        p = J(0, 21);
+        ell(p.x, p.y, p.z, 0.62f, 0.15f, 0.52f, 0.0f, -1, 0xFF2020E0, 10, 4);
         {
             float wob = (float)(((frame / 5) % 2) * 3);
-            float th = (12.0f + wob) / 20.0f;
-            p = J(-face * 9, 22.0f + (12.0f + wob) * 0.5f);
-            box(p.x, p.y, p.z, 0.25f, th, 0.3f, 0xFF2020E0);
+            tube(J(-face * 9, 22), J(-face * 12, 36.0f + wob), 0.15f, 0.10f, 0.4f, -1, 0xFF2020E0);
         }
         /* belt */
-        p = J(0, 48); box(p.x, p.y, p.z, 0.6f, 0.15f, 0.6f, 0xFF00D0FF);
-        /* boots */
-        p = J(l1x, l1y); box(p.x, p.y, p.z, 0.45f, 0.22f, 0.55f, 0xFFF0F0F0);
-        p = J(l2x, l2y); box(p.x, p.y, p.z, 0.45f, 0.22f, 0.55f, 0xFFF0F0F0);
+        p = J(0, 48);
+        ell(p.x, p.y, p.z, 0.44f, 0.10f, 0.38f, 0.0f, -1, 0xFF00D0FF, 10, 4);
     } else if (style == 1) {
         /* spiky hair */
-        p = J(-7, -1);  box(p.x, p.y, p.z, 0.2f, 0.4f, 0.3f, 0xFF30D0FF);
-        p = J(0, -3);   box(p.x, p.y, p.z, 0.25f, 0.6f, 0.3f, 0xFF30D0FF);
-        p = J(6, -1);   box(p.x, p.y, p.z, 0.2f, 0.4f, 0.3f, 0xFF30D0FF);
+        tube(v3(hd.x - 0.25f, hd.y + 0.38f, hd.z), v3(hd.x - 0.55f, hd.y + 1.0f, hd.z),
+             0.17f, 0.02f, 0.8f, -1, 0xFF30D0FF);
+        tube(v3(hd.x, hd.y + 0.45f, hd.z), v3(hd.x, hd.y + 1.2f, hd.z),
+             0.20f, 0.02f, 0.8f, -1, 0xFF30D0FF);
+        tube(v3(hd.x + 0.25f, hd.y + 0.38f, hd.z), v3(hd.x + 0.55f, hd.y + 1.0f, hd.z),
+             0.17f, 0.02f, 0.8f, -1, 0xFF30D0FF);
         /* headband */
-        p = J(0, 4);    box(p.x, p.y, p.z, 1.05f, 0.15f, 1.05f, 0xFFFFFFFF);
+        ell(hd.x, hd.y + 0.15f, hd.z, 0.57f, 0.07f, 0.57f, 0.0f, -1, 0xFFFFFFFF, 12, 3);
         /* belt */
-        p = J(0, 48);   box(p.x, p.y, p.z, 0.6f, 0.15f, 0.6f, 0xFFFFFFFF);
-        /* boots */
-        p = J(l1x, l1y); box(p.x, p.y, p.z, 0.45f, 0.22f, 0.55f, 0xFF202020);
-        p = J(l2x, l2y); box(p.x, p.y, p.z, 0.45f, 0.22f, 0.55f, 0xFF202020);
+        p = J(0, 48);
+        ell(p.x, p.y, p.z, 0.42f, 0.10f, 0.36f, 0.0f, -1, 0xFFFFFFFF, 10, 4);
+    } else if (style == 2) {
+        /* shoulder pads */
+        p = J(-13, 25); ell(p.x, p.y, p.z, 0.50f, 0.30f, 0.46f, 0.0f, -1, 0xFF909090, 8, 5);
+        p = J(13, 25);  ell(p.x, p.y, p.z, 0.50f, 0.30f, 0.46f, 0.0f, -1, 0xFF909090, 8, 5);
+        /* mohawk */
+        for (int m = -1; m <= 1; m++) {
+            float tip = (m == 0) ? 1.15f : 0.95f;
+            tube(v3(hd.x, hd.y + 0.45f, hd.z + m * 0.3f), v3(hd.x, hd.y + tip, hd.z + m * 0.3f),
+                 0.14f, 0.02f, 1.0f, -1, 0xFF2080FF);
+        }
+        /* big belt + buckle */
+        p = J(0, 48);
+        ell(p.x, p.y, p.z, 0.66f, 0.15f, 0.55f, 0.0f, -1, 0xFF30D0FF, 10, 4);
+        ell(p.x, p.y, p.z + 0.5f, 0.20f, 0.14f, 0.08f, 0.0f, -1, 0xFF00FFFF, 6, 4);
     } else {
-        /* heavy: shoulder pads, mohawk, big belt */
-        p = J(0, 25);   box(p.x, p.y, p.z, 1.7f, 0.3f, 1.2f, 0xFF909090);
-        p = J(0, -3);   box(p.x, p.y, p.z, 0.25f, 0.6f, 0.35f, 0xFF2080FF);
-        p = J(0, 48);   box(p.x, p.y, p.z, 0.8f, 0.2f, 0.95f, 0xFF30D0FF);
-        p = J(l1x, l1y); box(p.x, p.y, p.z, 0.5f, 0.25f, 0.65f, 0xFF303030);
-        p = J(l2x, l2y); box(p.x, p.y, p.z, 0.5f, 0.25f, 0.65f, 0xFF303030);
+        /* Stand: horns + chest gem */
+        tube(v3(hd.x - 0.28f, hd.y + 0.45f, hd.z), v3(hd.x - 0.40f, hd.y + 1.0f, hd.z),
+             0.13f, 0.02f, 0.8f, -1, 0xFFFFFF80);
+        tube(v3(hd.x + 0.28f, hd.y + 0.45f, hd.z), v3(hd.x + 0.40f, hd.y + 1.0f, hd.z),
+             0.13f, 0.02f, 0.8f, -1, 0xFFFFFF80);
+        p = J(0, 32);
+        ell(p.x, p.y, p.z + 0.35f, 0.18f, 0.18f, 0.10f, 0.0f, -1, 0xFF00FFFF, 6, 4);
     }
     g_flat = 0;
+    g_flash = 0;
 #undef J
 }
 
-static void draw_fallen(int x, uint32_t col) {
+static void draw_fallen(int x, int style) {
     g_flat = 0;
+    g_flash = 0;
+    uint32_t w = 0xFFFFFFFF;
     V3 hd = wp((float)x + 8.0f, (float)GROUND - 10.0f, 0.0f);
-    box(hd.x, hd.y, hd.z, 1.0f, 1.0f, 1.0f, col);
-    limb(wp(x + 18.0f, GROUND - 8.0f, 0), wp(x + 55.0f, GROUND - 8.0f, 0), 0.5f, 0.6f, col);
-    limb(wp(x + 55.0f, GROUND - 8.0f, 0), wp(x + 75.0f, GROUND - 14.0f, 0), 0.4f, 0.4f, col);
-    limb(wp(x + 55.0f, GROUND - 8.0f, 0), wp(x + 75.0f, GROUND - 2.0f, 0), 0.4f, 0.4f, col);
-    limb(wp(x + 25.0f, GROUND - 8.0f, 0), wp(x + 35.0f, GROUND - 22.0f, 0), 0.36f, 0.36f, col);
+    ell(hd.x, hd.y, hd.z, 0.55f, 0.55f, 0.55f, 0.0f, T_HEAD0 + style, w, 12, 8);
+    tube(wp(x + 18.0f, GROUND - 8.0f, 0), wp(x + 55.0f, GROUND - 8.0f, 0),
+         0.40f, 0.34f, 0.8f, T_BODY0 + style, w);
+    tube(wp(x + 55.0f, GROUND - 8.0f, 0), wp(x + 75.0f, GROUND - 14.0f, 0),
+         0.22f, 0.17f, 1.0f, T_LEGS0 + style, w);
+    tube(wp(x + 55.0f, GROUND - 8.0f, 0), wp(x + 75.0f, GROUND - 2.0f, 0),
+         0.22f, 0.17f, 1.0f, T_LEGS0 + style, w);
+    tube(wp(x + 25.0f, GROUND - 8.0f, 0), wp(x + 35.0f, GROUND - 22.0f, 0),
+         0.18f, 0.15f, 1.0f, T_BODY0 + style, w);
 }
 
 static void draw_shield(float xpx, float ypx) {
@@ -673,6 +1082,7 @@ static void draw_shield(float xpx, float ypx) {
    ===================================================================== */
 static void begin_frame(void) {
     sceGuStart(GU_DIRECT, list);
+    cur_tex = -2;
     sceGuClearColor(0xFF2A0C06);
     sceGuClearDepth(0);
     sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
@@ -714,8 +1124,22 @@ static void init_gu(void) {
 /* =====================================================================
    main
    ===================================================================== */
-int main(void) {
+int main(int argc, char **argv) {
     setup_callbacks();
+
+    /* folder that holds EBOOT.PBP (and the PNG textures) */
+    if (argc > 0 && argv != NULL && argv[0] != NULL) {
+        strncpy(basedir, argv[0], sizeof(basedir) - 1);
+        basedir[sizeof(basedir) - 1] = 0;
+        char *sl = strrchr(basedir, '/');
+        if (sl) sl[1] = 0; else basedir[0] = 0;
+    }
+
+    /* textures: build in code, then replace with any PNG files found */
+    gen_all();
+    for (int t = 0; t < NTEX; t++) ncustom += load_png(t, texname[t]);
+    sceKernelDcacheWritebackAll();
+
     init_gu();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
@@ -728,6 +1152,7 @@ int main(void) {
     int training = 0;
     int newround = 1;
     int matchwon = 0, mt = 0;
+    int msgt = 0, msgn = 0;
 
     /* player */
     int px = 100, py = GROUND - 80, vy = 0, pface = 1;
@@ -744,7 +1169,7 @@ int main(void) {
     int pcombo = 0, pcc = 0, ecombo = 0, ecc = 0;
     int shake = 0, rtime = ROUNDTIME;
     int frame = 0;
-    char buf[32];
+    char buf[64];
     SceCtrlData pad;
     unsigned int prev = 0;
 
@@ -763,6 +1188,11 @@ int main(void) {
             if ((pressed & PSP_CTRL_UP)    && lvl < 2) lvl++;
             if ((pressed & PSP_CTRL_DOWN)  && lvl > 0) lvl--;
             if (pressed & PSP_CTRL_SQUARE) training = !training;
+            if (pressed & PSP_CTRL_SELECT) {
+                msgn = export_all();
+                msgt = 240;
+            }
+            if (msgt > 0) msgt--;
             if (pressed & (PSP_CTRL_CROSS | PSP_CTRL_START)) {
                 ec = (pc + 1 + (frame & 1)) % 3;
                 pwins = 0; ewins = 0;
@@ -776,7 +1206,7 @@ int main(void) {
             for (int i = 0; i < 3; i++) {
                 float wx = (cfx[i] + 20 - 240) / 20.0f;
                 shadow(wx, 0.0f);
-                draw_fighter(cfx[i], GROUND - 80, 1, ccol[i], 0, 0, pc == i, frame, i, 0.0f);
+                draw_fighter(cfx[i], GROUND - 80, 1, 0, 0, 0, pc == i, frame, i, 0.0f);
             }
 
             sceGuDisable(GU_DEPTH_TEST);
@@ -812,8 +1242,21 @@ int main(void) {
                 rect(bx_ - 3, ay, 3, by_ - ay + 3, sc);
             }
 
+            if (msgt > 0) {
+                if (msgn > 0) sprintf(buf, "SAVED %d TEXTURE FILES", msgn);
+                else          sprintf(buf, "COULD NOT SAVE FILES");
+                textx(240, 25, msgn > 0 ? 0xFF30FF30 : 0xFF3030FF, buf);
+            }
             textx(240, 27, 0xFFD0D0D0, "UP/DOWN: LEVEL   SQUARE: MODE");
-            textx(240, 29, 0xFFD0D0D0, "SQ/TRI PUNCH  X/O KICK  UP JUMP  L BLOCK");
+            textx(240, 28, 0xFFD0D0D0, "SQ/TRI PUNCH  X/O KICK  UP JUMP  L BLOCK");
+            sprintf(buf, "CUSTOM PNG: %d/12 LOADED", ncustom);
+            textx(240, 30, 0xFFB0B0B0, buf);
+            textx(240, 31, 0xFFB0B0B0, "SELECT: SAVE TEMPLATE PNGS");
+            {
+                int n = (int)strlen(basedir);
+                const char *tail = (n > 44) ? basedir + (n - 44) : basedir;
+                textx(240, 32, 0xFF808080, tail);
+            }
         }
 
         /* ================= FIGHT ================= */
@@ -1083,33 +1526,35 @@ int main(void) {
 
             /* player side */
             if (ko > 0 && !pwon && !timeup) {
-                draw_fallen(px, ccol[pc]);
+                draw_fallen(px, pc);
             } else if (ko > 0 && !pwon && timeup) {
                 shadow(pwx, 0.0f);
-                draw_fighter(px, py, pface, ccol[pc], 0, 0, 0, frame, pc, 0.0f);
+                draw_fighter(px, py, pface, 0, 0, 0, 0, frame, pc, 0.0f);
             } else {
                 shadow(pwx, (GROUND - 80 - py) / 20.0f);
-                if (psp > 0)
-                    draw_fighter(px + pface * 35, py, pface, 0xFFE030A0,
-                                 ((psp / 3) % 2) ? 1 : 0, 0, 0, frame, 3, -0.9f);
-                draw_fighter(px, py, pface, pflash ? 0xFFFFFFFF : ccol[pc],
-                             patk, pblock, pwalk, frame, pc, 0.0f);
+                if (psp > 0) {
+                    g_stand = 0xFFE030A0;
+                    draw_fighter(px + pface * 35, py, pface, 0, ((psp / 3) % 2) ? 1 : 0,
+                                 0, 0, frame, 3, -0.9f);
+                }
+                draw_fighter(px, py, pface, pflash > 0, patk, pblock, pwalk, frame, pc, 0.0f);
                 if (pblock) draw_shield((pface == 1) ? px + 44.0f : px - 4.0f, py + 40.0f);
             }
 
             /* enemy side */
             if (ko > 0 && pwon && !timeup) {
-                draw_fallen(ex, ccol[ec]);
+                draw_fallen(ex, ec);
             } else if (ko > 0 && pwon && timeup) {
                 shadow(ewx, 0.0f);
-                draw_fighter(ex, GROUND - 80, eface, ccol[ec], 0, 0, 0, frame, ec, 0.0f);
+                draw_fighter(ex, GROUND - 80, eface, 0, 0, 0, 0, frame, ec, 0.0f);
             } else {
                 shadow(ewx, 0.0f);
-                if (esp > 0)
-                    draw_fighter(ex + eface * 35, GROUND - 80, eface, 0xFF40E060,
-                                 ((esp / 3) % 2) ? 1 : 0, 0, 0, frame, 3, -0.9f);
-                draw_fighter(ex, GROUND - 80, eface, eflash ? 0xFFFFFFFF : ccol[ec],
-                             eatk, eblock > 0, ewalk, frame, ec, 0.0f);
+                if (esp > 0) {
+                    g_stand = 0xFF40E060;
+                    draw_fighter(ex + eface * 35, GROUND - 80, eface, 0, ((esp / 3) % 2) ? 1 : 0,
+                                 0, 0, frame, 3, -0.9f);
+                }
+                draw_fighter(ex, GROUND - 80, eface, eflash > 0, eatk, eblock > 0, ewalk, frame, ec, 0.0f);
                 if (eblock > 0) draw_shield((eface == 1) ? ex + 44.0f : ex - 4.0f, GROUND - 40.0f);
             }
 
@@ -1233,9 +1678,9 @@ int main(void) {
             draw_stage(frame);
             if (matchwon) {
                 shadow(0.0f, 0.0f);
-                draw_fighter(220, GROUND - 80, 1, ccol[pc], 0, 0, 0, frame, pc, 0.0f);
+                draw_fighter(220, GROUND - 80, 1, 0, 0, 0, 0, frame, pc, 0.0f);
             } else {
-                draw_fallen(210, ccol[pc]);
+                draw_fallen(210, pc);
             }
 
             sceGuDisable(GU_DEPTH_TEST);
