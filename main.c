@@ -26,6 +26,12 @@ static void setup_callbacks(void) {
     if (t >= 0) sceKernelStartThread(t, 0, NULL);
 }
 
+static unsigned int seed = 12345;
+static int rnd(void) {
+    seed = seed * 1103515245u + 12345u;
+    return (seed >> 16) & 0x7fff;
+}
+
 static void rect(int x, int y, int w, int h, uint32_t color) {
     for (int j = y; j < y + h; j++) {
         if (j < 0 || j >= H) continue;
@@ -36,17 +42,23 @@ static void rect(int x, int y, int w, int h, uint32_t color) {
     }
 }
 
+static int clampx(int x) {
+    if (x < 0) return 0;
+    if (x > W - 40) return W - 40;
+    return x;
+}
+
 int main(void) {
     setup_callbacks();
     pspDebugScreenInit();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
-    int px = 100, py = GROUND - 80, vy = 0;
+    int px = 100, py = GROUND - 80, vy = 0, pface = 1;
     int php = 100, pflash = 0;
     int punch = 0, hit_done = 0;
 
-    int ex = 340, ehp = 100, eflash = 0;
+    int ex = 340, eface = -1, ehp = 100, eflash = 0;
     int epunch = 0, ecd = 60, ehit_done = 0;
 
     SceCtrlData pad;
@@ -58,10 +70,9 @@ int main(void) {
         prev = pad.Buttons;
 
         /* player movement */
-        if (pad.Buttons & PSP_CTRL_LEFT)  px -= 3;
-        if (pad.Buttons & PSP_CTRL_RIGHT) px += 3;
-        if (px < 0) px = 0;
-        if (px > W - 40) px = W - 40;
+        if (pad.Buttons & PSP_CTRL_LEFT)  { px -= 3; pface = -1; }
+        if (pad.Buttons & PSP_CTRL_RIGHT) { px += 3; pface = 1; }
+        px = clampx(px);
 
         if ((pressed & PSP_CTRL_CROSS) && py >= GROUND - 80) vy = -12;
         vy += 1;
@@ -71,25 +82,41 @@ int main(void) {
         /* player punch */
         if ((pressed & PSP_CTRL_SQUARE) && punch == 0) { punch = 12; hit_done = 0; }
         if (punch > 0) {
-            int fx = px + 40, fy = py + 20;
+            int fx = (pface == 1) ? px + 40 : px - 30;
+            int fy = py + 20;
             if (!hit_done && fx + 30 > ex && fx < ex + 40 &&
                 fy + 15 > GROUND - 80 && fy < GROUND) {
                 ehp -= 10; eflash = 6; hit_done = 1;
+                ex = clampx(ex + 15 * pface);
             }
             punch--;
         }
 
-        /* enemy AI: punch when player is close */
+        /* enemy AI */
+        int dx = px - ex;
+        int dist = dx < 0 ? -dx : dx;
+        eface = (dx >= 0) ? 1 : -1;
         if (ecd > 0) ecd--;
-        if (epunch == 0 && ecd == 0) {
-            int dist = ex - (px + 40);
-            if (dist < 80 && dist > -40) { epunch = 14; ehit_done = 0; ecd = 70; }
+
+        if (epunch == 0) {
+            if (dist > 70) {
+                ex += eface * 2;                 /* walk toward player */
+            } else if (ecd > 0 && dist < 55) {
+                ex -= eface;                     /* back away while waiting */
+            } else if (ecd == 0) {
+                epunch = 14; ehit_done = 0;      /* attack */
+                ecd = 40 + (rnd() % 40);
+            }
         }
+        ex = clampx(ex);
+
         if (epunch > 0) {
-            int fx = ex - 30, fy = GROUND - 60;
+            int fx = (eface == 1) ? ex + 40 : ex - 30;
+            int fy = GROUND - 60;
             if (!ehit_done && fx + 30 > px && fx < px + 40 &&
                 fy + 15 > py && fy < py + 80) {
                 php -= 10; pflash = 6; ehit_done = 1;
+                px = clampx(px + 15 * eface);
             }
             epunch--;
         }
@@ -101,15 +128,16 @@ int main(void) {
         if (php <= 0 || ehp <= 0) {
             php = 100; ehp = 100;
             px = 100; ex = 340;
+            epunch = 0; punch = 0; ecd = 60;
         }
 
         /* draw */
         rect(0, 0, W, H, 0xFF402010);
         rect(0, GROUND, W, H - GROUND, 0xFF204020);
         rect(px, py, 40, 80, pflash ? 0xFFFFFFFF : 0xFF30A0E0);
-        if (punch > 0) rect(px + 40, py + 20, 30, 15, 0xFF30E0FF);
+        if (punch > 0) rect((pface == 1) ? px + 40 : px - 30, py + 20, 30, 15, 0xFF30E0FF);
         rect(ex, GROUND - 80, 40, 80, eflash ? 0xFFFFFFFF : 0xFF3030C0);
-        if (epunch > 0) rect(ex - 30, GROUND - 60, 30, 15, 0xFF2020FF);
+        if (epunch > 0) rect((eface == 1) ? ex + 40 : ex - 30, GROUND - 60, 30, 15, 0xFF2020FF);
 
         /* health bars */
         rect(20, 10, 200, 14, 0xFF000000);
