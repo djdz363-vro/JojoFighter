@@ -2,21 +2,33 @@
 #include <pspdebug.h>
 #include <pspdisplay.h>
 #include <pspctrl.h>
+#include <pspgu.h>
+#include <pspgum.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 
 PSP_MODULE_INFO("JojoFighter", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 
+#define BUF_W 512
+#define SCR_W 480
+#define SCR_H 272
 #define W 480
 #define H 272
-#define STRIDE 512
 #define GROUND 220
 #define MAXHP 125
 #define ROUNDTIME 3600   /* 60 seconds at 60 fps */
 
-static uint32_t *vram = (uint32_t *)0x44000000;
-static int ox = 0, oy = 0;   /* screen shake offset */
+static unsigned int __attribute__((aligned(64))) list[262144];
+
+typedef struct { uint32_t color; float x, y, z; } Vtx;
+typedef struct { float x, y, z; } V3;
+
+#define VT3 (GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D)
+#define VT2 (GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D)
+
+static V3 v3(float x, float y, float z) { V3 r; r.x = x; r.y = y; r.z = z; return r; }
 
 /* characters: 0 = Brawler, 1 = Speedster, 2 = Heavy */
 static const int cspd[3]  = {3, 4, 2};
@@ -38,11 +50,11 @@ static const char *lvname[3] = {"EASY", "NORMAL", "HARD"};
 static const uint32_t lvcol[3] = {0xFF30FF30, 0xFF00E0FF, 0xFF3030FF};
 
 /* moves: 1 light punch, 2 heavy punch, 3 light kick, 4 heavy kick */
-static const int mdur[5]   = {0, 10, 20, 14, 26};   /* total frames */
-static const int mstart[5] = {0, 3, 8, 5, 12};      /* frames before it can hit */
-static const int mkb[5]    = {0, 8, 20, 12, 30};    /* knockback */
-static const int mshk[5]   = {0, 3, 7, 4, 11};      /* screen shake */
-static const int mmtr[5]   = {0, 6, 12, 7, 13};     /* meter gain */
+static const int mdur[5]   = {0, 10, 20, 14, 26};
+static const int mstart[5] = {0, 3, 8, 5, 12};
+static const int mkb[5]    = {0, 8, 20, 12, 30};
+static const int mshk[5]   = {0, 3, 7, 4, 11};
+static const int mmtr[5]   = {0, 6, 12, 7, 13};
 
 static int movedmg(int type, int ch) {
     int base = (type <= 2) ? cpun[ch] : ckick[ch];
@@ -80,44 +92,6 @@ static int rnd(void) {
     return (seed >> 16) & 0x7fff;
 }
 
-static void rect(int x, int y, int w, int h, uint32_t color) {
-    x += ox; y += oy;
-    for (int j = y; j < y + h; j++) {
-        if (j < 0 || j >= H) continue;
-        for (int i = x; i < x + w; i++) {
-            if (i < 0 || i >= W) continue;
-            vram[j * STRIDE + i] = color;
-        }
-    }
-}
-
-static void disc(int cx, int cy, int r, uint32_t color) {
-    cx += ox; cy += oy;
-    for (int j = -r; j <= r; j++) {
-        for (int i = -r; i <= r; i++) {
-            if (i * i + j * j <= r * r) {
-                int x = cx + i, y = cy + j;
-                if (x >= 0 && x < W && y >= 0 && y < H) vram[y * STRIDE + x] = color;
-            }
-        }
-    }
-}
-
-static void line(int x0, int y0, int x1, int y1, int t, uint32_t color) {
-    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
-    int dy = y1 > y0 ? y0 - y1 : y1 - y0;   /* negative abs */
-    int sx = x0 < x1 ? 1 : -1;
-    int sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    while (1) {
-        rect(x0 - t / 2, y0 - t / 2, t, t, color);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
-    }
-}
-
 static int clampx(int x) {
     if (x < 0) return 0;
     if (x > W - 40) return W - 40;
@@ -133,22 +107,81 @@ static int barw(int hp) {
     return hp * 200 / MAXHP;
 }
 
-/* ---------- text helpers (debug font: 7 px wide, 8 px tall cells) ---------- */
+/* =====================================================================
+   2D drawing (screen pixels) - used for UI
+   ===================================================================== */
+static void rect(int x, int y, int w, int h, uint32_t c) {
+    Vtx *v = (Vtx *)sceGuGetMemory(2 * sizeof(Vtx));
+    v[0].color = c; v[0].x = (float)x;       v[0].y = (float)y;       v[0].z = 0;
+    v[1].color = c; v[1].x = (float)(x + w); v[1].y = (float)(y + h); v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES, VT2, 2, 0, v);
+}
+
+static void disc(int cx, int cy, int r, uint32_t c) {
+    int n = 24;
+    Vtx *v = (Vtx *)sceGuGetMemory((n + 2) * sizeof(Vtx));
+    v[0].color = c; v[0].x = (float)cx; v[0].y = (float)cy; v[0].z = 0;
+    for (int i = 0; i <= n; i++) {
+        float a = i * 6.2831853f / n;
+        v[i + 1].color = c;
+        v[i + 1].x = cx + cosf(a) * r;
+        v[i + 1].y = cy + sinf(a) * r;
+        v[i + 1].z = 0;
+    }
+    sceGuDrawArray(GU_TRIANGLE_FAN, VT2, n + 2, 0, v);
+}
+
+static void line(int x0, int y0, int x1, int y1, int t, uint32_t c) {
+    float dx = (float)(x1 - x0), dy = (float)(y1 - y0);
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 0.001f) { rect(x0 - t / 2, y0 - t / 2, t, t, c); return; }
+    float nx = -dy / len * t * 0.5f, ny = dx / len * t * 0.5f;
+    Vtx *v = (Vtx *)sceGuGetMemory(4 * sizeof(Vtx));
+    v[0].color = c; v[0].x = x0 + nx; v[0].y = y0 + ny; v[0].z = 0;
+    v[1].color = c; v[1].x = x0 - nx; v[1].y = y0 - ny; v[1].z = 0;
+    v[2].color = c; v[2].x = x1 - nx; v[2].y = y1 - ny; v[2].z = 0;
+    v[3].color = c; v[3].x = x1 + nx; v[3].y = y1 + ny; v[3].z = 0;
+    sceGuDrawArray(GU_TRIANGLE_FAN, VT2, 4, 0, v);
+}
+
+/* =====================================================================
+   Text (queued, printed after the GPU finishes the frame)
+   ===================================================================== */
+typedef struct { int col, row; uint32_t color; char s[48]; } Txt;
+static Txt txq[96];
+static int ntx = 0;
+
+static void qtext(int col, int row, uint32_t color, const char *s) {
+    if (ntx >= 96) return;
+    if (col < 0) col = 0;
+    if (col > 67) col = 67;
+    if (row < 0) row = 0;
+    if (row > 33) row = 33;
+    txq[ntx].col = col; txq[ntx].row = row; txq[ntx].color = color;
+    int i = 0;
+    while (s[i] && i < 47) { txq[ntx].s[i] = s[i]; i++; }
+    txq[ntx].s[i] = 0;
+    ntx++;
+}
+
 static void textx(int xc, int row, uint32_t color, const char *s) {
     int n = 0;
     while (s[n]) n++;
-    int col = (xc - n * 7 / 2) / 7;
-    if (col < 0) col = 0;
-    if (col > 67) col = 67;
-    pspDebugScreenSetTextColor(color);
-    pspDebugScreenSetXY(col, row);
-    pspDebugScreenPrintf("%s", s);
+    qtext((xc - n * 7 / 2) / 7, row, color, s);
 }
 
 static void textl(int col, int row, uint32_t color, const char *s) {
-    pspDebugScreenSetTextColor(color);
-    pspDebugScreenSetXY(col, row);
-    pspDebugScreenPrintf("%s", s);
+    qtext(col, row, color, s);
+}
+
+static void flush_text(int offset) {
+    pspDebugScreenSetOffset(offset);
+    for (int i = 0; i < ntx; i++) {
+        pspDebugScreenSetTextColor(txq[i].color);
+        pspDebugScreenSetXY(txq[i].col, txq[i].row);
+        pspDebugScreenPrintf("%s", txq[i].s);
+    }
+    ntx = 0;
 }
 
 static int put_int(char *b, int v) {
@@ -167,7 +200,170 @@ static void combo_str(char *buf, int n) {
     buf[k] = 0;
 }
 
-/* ---------- hit sparks ---------- */
+/* =====================================================================
+   3D helpers
+   World units: 1 unit = 20 old pixels. Ground is y = 0, fighters ~4 tall.
+   ===================================================================== */
+static int g_flat = 0;   /* 1 = no shading */
+static V3 cam_eye, cam_ctr;
+
+static V3 wp(float px_, float py_, float z) {
+    return v3((px_ - 240.0f) / 20.0f, ((float)GROUND - py_) / 20.0f, z);
+}
+
+static uint32_t shadec(uint32_t c, float f) {
+    if (f > 1.0f) f = 1.0f;
+    if (f < 0.0f) f = 0.0f;
+    uint32_t r = c & 255, g = (c >> 8) & 255, b = (c >> 16) & 255;
+    r = (uint32_t)(r * f); g = (uint32_t)(g * f); b = (uint32_t)(b * f);
+    return 0xFF000000u | (b << 16) | (g << 8) | r;
+}
+
+#define PV(P) do { v[k].color = col; v[k].x = (P)->x; v[k].y = (P)->y; v[k].z = (P)->z; k++; } while (0)
+
+/* c[0..3] = one end, c[4..7] = other end */
+static void prism(const V3 *c, uint32_t color) {
+    static const int F[6][4] = {{0,1,2,3},{4,5,6,7},{0,1,5,4},{1,2,6,5},{2,3,7,6},{3,0,4,7}};
+    float mx = 0, my = 0, mz = 0;
+    for (int i = 0; i < 8; i++) { mx += c[i].x; my += c[i].y; mz += c[i].z; }
+    mx /= 8; my /= 8; mz /= 8;
+
+    Vtx *v = (Vtx *)sceGuGetMemory(36 * sizeof(Vtx));
+    int k = 0;
+    for (int f = 0; f < 6; f++) {
+        const V3 *a = &c[F[f][0]], *b = &c[F[f][1]], *cc = &c[F[f][2]], *d = &c[F[f][3]];
+        float e1x = b->x - a->x, e1y = b->y - a->y, e1z = b->z - a->z;
+        float e2x = d->x - a->x, e2y = d->y - a->y, e2z = d->z - a->z;
+        float nx = e1y * e2z - e1z * e2y;
+        float ny = e1z * e2x - e1x * e2z;
+        float nz = e1x * e2y - e1y * e2x;
+        float len = sqrtf(nx * nx + ny * ny + nz * nz);
+        if (len < 1e-6f) len = 1.0f;
+        nx /= len; ny /= len; nz /= len;
+        float qx = (a->x + cc->x) * 0.5f - mx;
+        float qy = (a->y + cc->y) * 0.5f - my;
+        float qz = (a->z + cc->z) * 0.5f - mz;
+        if (nx * qx + ny * qy + nz * qz < 0) { nx = -nx; ny = -ny; nz = -nz; }
+        float sh = 1.0f;
+        if (!g_flat) {
+            float dp = nx * -0.348f + ny * 0.795f + nz * 0.497f;
+            if (dp < 0) dp = 0;
+            sh = 0.45f + 0.55f * dp;
+        }
+        uint32_t col = shadec(color, sh);
+        PV(a); PV(b); PV(cc);
+        PV(a); PV(cc); PV(d);
+    }
+    sceGuDrawArray(GU_TRIANGLES, VT3, 36, 0, v);
+}
+
+static void box(float cx, float cy, float cz, float w, float h, float d, uint32_t col) {
+    float x0 = cx - w * 0.5f, x1 = cx + w * 0.5f;
+    float y0 = cy - h * 0.5f, y1 = cy + h * 0.5f;
+    float z0 = cz - d * 0.5f, z1 = cz + d * 0.5f;
+    V3 c[8];
+    c[0] = v3(x0, y0, z0); c[1] = v3(x1, y0, z0); c[2] = v3(x1, y0, z1); c[3] = v3(x0, y0, z1);
+    c[4] = v3(x0, y1, z0); c[5] = v3(x1, y1, z0); c[6] = v3(x1, y1, z1); c[7] = v3(x0, y1, z1);
+    prism(c, col);
+}
+
+static void limb(V3 a, V3 b, float t, float d, uint32_t col) {
+    float dx = b.x - a.x, dy = b.y - a.y;
+    float len = sqrtf(dx * dx + dy * dy);
+    float nx, ny;
+    if (len < 0.001f) { nx = 1.0f; ny = 0.0f; }
+    else { nx = -dy / len; ny = dx / len; }
+    nx *= t * 0.5f; ny *= t * 0.5f;
+    float hz = d * 0.5f;
+    V3 c[8];
+    c[0] = v3(a.x - nx, a.y - ny, a.z - hz);
+    c[1] = v3(a.x + nx, a.y + ny, a.z - hz);
+    c[2] = v3(a.x + nx, a.y + ny, a.z + hz);
+    c[3] = v3(a.x - nx, a.y - ny, a.z + hz);
+    c[4] = v3(b.x - nx, b.y - ny, b.z - hz);
+    c[5] = v3(b.x + nx, b.y + ny, b.z - hz);
+    c[6] = v3(b.x + nx, b.y + ny, b.z + hz);
+    c[7] = v3(b.x - nx, b.y - ny, b.z + hz);
+    prism(c, col);
+}
+
+static void qv(Vtx *v, int *k, float x, float y, float z, uint32_t c) {
+    v[*k].color = c; v[*k].x = x; v[*k].y = y; v[*k].z = z; (*k)++;
+}
+
+static void quadxy(Vtx *v, int *k, float x0, float y0, float x1, float y1, float z, uint32_t c) {
+    qv(v, k, x0, y0, z, c); qv(v, k, x1, y0, z, c); qv(v, k, x1, y1, z, c);
+    qv(v, k, x0, y0, z, c); qv(v, k, x1, y1, z, c); qv(v, k, x0, y1, z, c);
+}
+
+static void quadxz(Vtx *v, int *k, float x0, float z0, float x1, float z1, float y, uint32_t c) {
+    qv(v, k, x0, y, z0, c); qv(v, k, x1, y, z0, c); qv(v, k, x1, y, z1, c);
+    qv(v, k, x0, y, z0, c); qv(v, k, x1, y, z1, c); qv(v, k, x0, y, z1, c);
+}
+
+static void disc3(float cx, float cy, float cz, float r, uint32_t c) {
+    int n = 24;
+    Vtx *v = (Vtx *)sceGuGetMemory((n + 2) * sizeof(Vtx));
+    v[0].color = c; v[0].x = cx; v[0].y = cy; v[0].z = cz;
+    for (int i = 0; i <= n; i++) {
+        float a = i * 6.2831853f / n;
+        v[i + 1].color = c;
+        v[i + 1].x = cx + cosf(a) * r;
+        v[i + 1].y = cy + sinf(a) * r;
+        v[i + 1].z = cz;
+    }
+    sceGuDrawArray(GU_TRIANGLE_FAN, VT3, n + 2, 0, v);
+}
+
+static void shadow(float wx, float height) {
+    float s = 1.3f / (1.0f + height * 0.35f);
+    uint32_t c = 0xFF0C200C;
+    Vtx *v = (Vtx *)sceGuGetMemory(4 * sizeof(Vtx));
+    v[0].color = c; v[0].x = wx - s; v[0].y = 0.03f; v[0].z = 0.9f;
+    v[1].color = c; v[1].x = wx + s; v[1].y = 0.03f; v[1].z = 0.9f;
+    v[2].color = c; v[2].x = wx + s; v[2].y = 0.03f; v[2].z = -0.9f;
+    v[3].color = c; v[3].x = wx - s; v[3].y = 0.03f; v[3].z = -0.9f;
+    sceGuDrawArray(GU_TRIANGLE_FAN, VT3, 4, 0, v);
+}
+
+static void set_camera(V3 eye, V3 ctr) {
+    cam_eye = eye; cam_ctr = ctr;
+    sceGumMatrixMode(GU_PROJECTION);
+    sceGumLoadIdentity();
+    sceGumPerspective(60.0f, 480.0f / 272.0f, 3.0f, 150.0f);
+    sceGumMatrixMode(GU_VIEW);
+    sceGumLoadIdentity();
+    ScePspFVector3 e, c, u;
+    e.x = eye.x; e.y = eye.y; e.z = eye.z;
+    c.x = ctr.x; c.y = ctr.y; c.z = ctr.z;
+    u.x = 0.0f; u.y = 1.0f; u.z = 0.0f;
+    sceGumLookAt(&e, &c, &u);
+    sceGumMatrixMode(GU_MODEL);
+    sceGumLoadIdentity();
+}
+
+/* world point -> screen pixel (for text placement) */
+static int project(float x, float y, float z, int *sx, int *sy) {
+    float fx = cam_ctr.x - cam_eye.x, fy = cam_ctr.y - cam_eye.y, fz = cam_ctr.z - cam_eye.z;
+    float fl = sqrtf(fx * fx + fy * fy + fz * fz);
+    fx /= fl; fy /= fl; fz /= fl;
+    float rx = -fz, ry = 0.0f, rz = fx;
+    float rl = sqrtf(rx * rx + rz * rz);
+    rx /= rl; rz /= rl;
+    float ux = ry * fz - rz * fy;
+    float uy = rz * fx - rx * fz;
+    float uz = rx * fy - ry * fx;
+    float px_ = x - cam_eye.x, py_ = y - cam_eye.y, pz_ = z - cam_eye.z;
+    float xc = px_ * rx + py_ * ry + pz_ * rz;
+    float yc = px_ * ux + py_ * uy + pz_ * uz;
+    float zc = px_ * fx + py_ * fy + pz_ * fz;
+    if (zc < 0.1f) { *sx = 240; *sy = 136; return 0; }
+    *sx = (int)(240.0f + 235.6f * xc / zc);
+    *sy = (int)(136.0f - 235.6f * yc / zc);
+    return 1;
+}
+
+/* ---------- hit sparks (stored in old pixel coordinates) ---------- */
 typedef struct { int x, y, t, kind; } Spark;   /* kind: 0 hit, 1 big hit, 2 blocked */
 static Spark sparks[8];
 
@@ -181,150 +377,268 @@ static void add_spark(int x, int y, int kind) {
 }
 
 static void draw_sparks(void) {
+    g_flat = 1;
     for (int i = 0; i < 8; i++) {
         if (sparks[i].t <= 0) continue;
         int k = sparks[i].kind;
-        int L = (8 - sparks[i].t) * 2 + 6 + (k == 1 ? 6 : 0);
+        float L = ((8 - sparks[i].t) * 2 + 6 + (k == 1 ? 6 : 0)) / 20.0f;
         uint32_t c = (k == 2) ? 0xFFFFE0A0 : 0xFF30D0FF;
-        int x = sparks[i].x, y = sparks[i].y;
-        line(x - L, y, x + L, y, 3, c);
-        line(x, y - L, x, y + L, 3, c);
-        line(x - L * 2 / 3, y - L * 2 / 3, x + L * 2 / 3, y + L * 2 / 3, 3, c);
-        line(x - L * 2 / 3, y + L * 2 / 3, x + L * 2 / 3, y - L * 2 / 3, 3, c);
-        disc(x, y, 4, 0xFFFFFFFF);
+        float x = (sparks[i].x - 240.0f) / 20.0f;
+        float y = ((float)GROUND - sparks[i].y) / 20.0f;
+        float z = 1.3f;
+        float l2 = L * 0.66f;
+        limb(v3(x - L, y, z), v3(x + L, y, z), 0.18f, 0.18f, c);
+        limb(v3(x, y - L, z), v3(x, y + L, z), 0.18f, 0.18f, c);
+        limb(v3(x - l2, y - l2, z), v3(x + l2, y + l2, z), 0.18f, 0.18f, c);
+        limb(v3(x - l2, y + l2, z), v3(x + l2, y - l2, z), 0.18f, 0.18f, c);
+        box(x, y, z, 0.3f, 0.3f, 0.3f, 0xFFFFFFFF);
     }
+    g_flat = 0;
 }
 
-/* ---------- stage ---------- */
-static const int bh[12] = {60, 90, 50, 110, 70, 80, 55, 100, 65, 85, 45, 95};
-
+/* ---------- 3D stage ---------- */
 static void draw_stage(int frame) {
-    rect(0, 0, W, 90, 0xFF2A0C06);
-    rect(0, 90, W, 70, 0xFF381410);
-    rect(0, 160, W, GROUND - 160, 0xFF481C14);
+    g_flat = 0;
+
+    /* horizon glow */
+    {
+        Vtx *v = (Vtx *)sceGuGetMemory(6 * sizeof(Vtx));
+        int k = 0;
+        uint32_t lo = 0xFF481C14, hi = 0xFF2A0C06;
+        qv(v, &k, -160, 0, -52, lo); qv(v, &k, 160, 0, -52, lo); qv(v, &k, 160, 16, -52, hi);
+        qv(v, &k, -160, 0, -52, lo); qv(v, &k, 160, 16, -52, hi); qv(v, &k, -160, 16, -52, hi);
+        sceGuDrawArray(GU_TRIANGLES, VT3, 6, 0, v);
+    }
 
     /* stars */
-    for (int i = 0; i < 30; i++) {
-        int x = (i * 97 + 13) % W;
-        int y = (i * 41 + 7) % 110 + 8;
-        if ((frame / 8 + i) % 5 != 0) rect(x, y, 2, 2, 0xFFFFFFFF);
+    {
+        Vtx *v = (Vtx *)sceGuGetMemory(30 * 6 * sizeof(Vtx));
+        int k = 0;
+        for (int i = 0; i < 30; i++) {
+            if ((frame / 8 + i) % 5 == 0) continue;
+            float x = -60.0f + (float)((i * 37) % 121);
+            float y = 14.0f + (float)((i * 53) % 30);
+            quadxy(v, &k, x, y, x + 0.5f, y + 0.5f, -55.0f, 0xFFFFFFFF);
+        }
+        if (k > 0) sceGuDrawArray(GU_TRIANGLES, VT3, k, 0, v);
     }
 
     /* moon (crescent) */
-    disc(400, 55, 20, 0xFFC0F8FF);
-    disc(409, 50, 18, 0xFF2A0C06);
+    disc3(20.0f, 24.0f, -50.0f, 4.5f, 0xFFC0F8FF);
+    disc3(22.2f, 25.2f, -49.5f, 4.0f, 0xFF2A0C06);
 
-    /* skyline */
-    for (int b = 0; b < 12; b++) {
-        int x = b * 40;
-        int h = bh[b];
-        rect(x + 2, GROUND - h, 36, h, 0xFF140804);
-        for (int wy = GROUND - h + 8; wy < GROUND - 10; wy += 14) {
-            for (int wx = x + 8; wx < x + 32; wx += 12) {
-                if (((b * 7 + wx / 4 + wy / 3) % 5) < 2)
-                    rect(wx, wy, 5, 6, 0xFF40C8F0);
-            }
+    /* ground stripes */
+    {
+        Vtx *v = (Vtx *)sceGuGetMemory(16 * 6 * sizeof(Vtx));
+        int k = 0;
+        for (int i = 0; i < 16; i++) {
+            float x0 = -48.0f + i * 6.0f;
+            quadxz(v, &k, x0, -46.0f, x0 + 6.0f, 26.0f, 0.0f,
+                   (i & 1) ? 0xFF285028 : 0xFF204020);
         }
+        sceGuDrawArray(GU_TRIANGLES, VT3, k, 0, v);
     }
 
-    /* ground */
-    rect(0, GROUND, W, H - GROUND, 0xFF204020);
-    rect(0, GROUND, W, 3, 0xFF307030);
+    /* skyline */
+    for (int b = 0; b < 17; b++) {
+        float x = -48.0f + b * 6.0f;
+        float h = 6.0f + (float)((b * 37) % 11);
+        box(x, h * 0.5f, -26.0f, 5.0f, h, 4.0f, 0xFF140804);
+
+        Vtx *v = (Vtx *)sceGuGetMemory(150 * sizeof(Vtx));
+        int n = 0;
+        for (float y = 1.5f; y < h - 1.0f; y += 2.0f) {
+            for (int c = 0; c < 3; c++) {
+                float wx = x - 1.5f + c * 1.5f;
+                if (((b * 7 + c * 3 + (int)y * 5) % 5) < 2)
+                    quadxy(v, &n, wx - 0.3f, y - 0.35f, wx + 0.3f, y + 0.35f, -23.8f, 0xFF40C8F0);
+            }
+        }
+        if (n > 0) sceGuDrawArray(GU_TRIANGLES, VT3, n, 0, v);
+    }
 }
 
-/* atk: 0 none, 1 light punch, 2 heavy punch, 3 light kick, 4 heavy kick.
-   style: 0 brawler, 1 speedster, 2 heavy, 3 stand */
+/* =====================================================================
+   3D fighter
+   atk: 0 none, 1 light punch, 2 heavy punch, 3 light kick, 4 heavy kick
+   style: 0 brawler, 1 speedster, 2 heavy, 3 stand
+   ===================================================================== */
 static void draw_fighter(int x, int y, int face, uint32_t col,
-                         int atk, int block, int walk, int frame, int style) {
-    int cx = x + 20;
+                         int atk, int block, int walk, int frame, int style, float z) {
+    float cx = (float)x + 20.0f, ty = (float)y;
     int air = (y < GROUND - 80);
+    V3 p;
+    g_flat = (col == 0xFFFFFFFF);
+
+#define J(dx, dy) wp(cx + (float)(dx), ty + (float)(dy), z)
 
     /* head + eye */
-    disc(cx, y + 10, 10, col);
-    rect(cx + face * 5 - 2, y + 7, 5, 5, 0xFF00FFFF);
+    p = J(0, 10);
+    box(p.x, p.y, p.z, 1.0f, 1.0f, 1.0f, col);
+    {
+        int sf = g_flat;
+        g_flat = 1;
+        box(p.x + face * 0.22f, p.y + 0.1f, p.z + 0.53f, 0.26f, 0.26f, 0.1f, 0xFF00FFFF);
+        g_flat = sf;
+    }
 
-    /* body */
-    line(cx, y + 20, cx, y + 50, 4, col);
+    /* torso */
+    {
+        float tw = (style == 2) ? 1.3f : 0.7f;
+        float td = (style == 2) ? 0.9f : 0.55f;
+        limb(J(0, 20), J(0, 50), tw, td, col);
+    }
 
     /* arms */
     int fx, fy, bx, by;
-    if (atk == 1)      { fx = cx + face * 38; fy = y + 30; bx = cx - face * 10; by = y + 42; }
-    else if (atk == 2) { fx = cx + face * 58; fy = y + 26; bx = cx - face * 16; by = y + 34; }
-    else if (block)    { fx = cx + face * 16; fy = y + 16; bx = cx + face * 8;  by = y + 14; }
-    else               { fx = cx + face * 14; fy = y + 42; bx = cx - face * 12; by = y + 42; }
-    line(cx, y + 28, fx, fy, 4, col);
-    line(cx, y + 28, bx, by, 4, col);
+    if (atk == 1)      { fx = face * 38; fy = 30; bx = -face * 10; by = 42; }
+    else if (atk == 2) { fx = face * 58; fy = 26; bx = -face * 16; by = 34; }
+    else if (block)    { fx = face * 16; fy = 16; bx = face * 8;   by = 14; }
+    else               { fx = face * 14; fy = 42; bx = -face * 12; by = 42; }
+    limb(J(0, 28), J(fx, fy), 0.36f, 0.36f, col);
+    limb(J(0, 28), J(bx, by), 0.36f, 0.36f, col);
 
     /* legs */
     int l1x, l1y, l2x, l2y;
     int spread = ((frame / 6) % 2) ? 14 : 4;
-    if (atk == 3)      { l1x = cx + face * 50; l1y = y + 64; l2x = cx - face * 6; l2y = y + 80; }
-    else if (atk == 4) { l1x = cx + face * 66; l1y = y + 42; l2x = cx - face * 8; l2y = y + 80; }
-    else if (air)      { l1x = cx + 10; l1y = y + 70; l2x = cx - 10; l2y = y + 72; }
-    else if (walk)     { l1x = cx + spread; l1y = y + 80; l2x = cx - spread; l2y = y + 80; }
-    else               { l1x = cx + 8; l1y = y + 80; l2x = cx - 8; l2y = y + 80; }
-    line(cx, y + 50, l1x, l1y, 4, col);
-    line(cx, y + 50, l2x, l2y, 4, col);
+    if (atk == 3)      { l1x = face * 50; l1y = 64; l2x = -face * 6; l2y = 80; }
+    else if (atk == 4) { l1x = face * 66; l1y = 42; l2x = -face * 8; l2y = 80; }
+    else if (air)      { l1x = 10; l1y = 70; l2x = -10; l2y = 72; }
+    else if (walk)     { l1x = spread; l1y = 80; l2x = -spread; l2y = 80; }
+    else               { l1x = 8; l1y = 80; l2x = -8; l2y = 80; }
+    {
+        float lt = (style == 2) ? 0.55f : 0.4f;
+        limb(J(0, 50), J(l1x, l1y), lt, lt, col);
+        limb(J(0, 50), J(l2x, l2y), lt, lt, col);
+    }
 
-    /* ---- details ---- */
     if (style == 3) {
-        rect(cx - 8, y - 6, 4, 8, 0xFFFFFF80);
-        rect(cx + 4, y - 6, 4, 8, 0xFFFFFF80);
-        disc(cx, y + 32, 3, 0xFF00FFFF);
+        /* Stand: horns + chest gem */
+        p = J(-6, -3); box(p.x, p.y, p.z, 0.2f, 0.45f, 0.25f, 0xFFFFFF80);
+        p = J(6, -3);  box(p.x, p.y, p.z, 0.2f, 0.45f, 0.25f, 0xFFFFFF80);
+        p = J(0, 32);
+        g_flat = 1;
+        box(p.x, p.y, p.z + 0.3f, 0.35f, 0.35f, 0.2f, 0xFF00FFFF);
+        g_flat = 0;
         return;
     }
 
     /* hands */
-    disc(fx, fy, 3, 0xFFA0D0FF);
-    disc(bx, by, 3, 0xFFA0D0FF);
+    p = J(fx, fy); box(p.x, p.y, p.z, 0.34f, 0.34f, 0.34f, 0xFFA0D0FF);
+    p = J(bx, by); box(p.x, p.y, p.z, 0.34f, 0.34f, 0.34f, 0xFFA0D0FF);
 
     if (style == 0) {
         /* cap + brim */
-        rect(cx - 10, y - 3, 20, 7, 0xFFF0F0F0);
-        rect((face == 1) ? cx + 4 : cx - 14, y + 2, 10, 3, 0xFFF0F0F0);
+        p = J(0, -1);       box(p.x, p.y, p.z, 1.1f, 0.35f, 1.1f, 0xFFF0F0F0);
+        p = J(face * 10, 3); box(p.x, p.y, p.z, 0.6f, 0.15f, 0.95f, 0xFFF0F0F0);
         /* scarf + fluttering tail */
-        rect(cx - 6, y + 19, 12, 4, 0xFF2020E0);
-        rect(cx - face * 9 - 2, y + 22, 5, 12 + ((frame / 5) % 2) * 3, 0xFF2020E0);
+        p = J(0, 21);       box(p.x, p.y, p.z, 0.95f, 0.22f, 0.8f, 0xFF2020E0);
+        {
+            float wob = (float)(((frame / 5) % 2) * 3);
+            float th = (12.0f + wob) / 20.0f;
+            p = J(-face * 9, 22.0f + (12.0f + wob) * 0.5f);
+            box(p.x, p.y, p.z, 0.25f, th, 0.3f, 0xFF2020E0);
+        }
         /* belt */
-        rect(cx - 5, y + 47, 10, 3, 0xFF00D0FF);
+        p = J(0, 48); box(p.x, p.y, p.z, 0.6f, 0.15f, 0.6f, 0xFF00D0FF);
         /* boots */
-        rect(l1x - 3, l1y - 2, 7, 4, 0xFFF0F0F0);
-        rect(l2x - 3, l2y - 2, 7, 4, 0xFFF0F0F0);
+        p = J(l1x, l1y); box(p.x, p.y, p.z, 0.45f, 0.22f, 0.55f, 0xFFF0F0F0);
+        p = J(l2x, l2y); box(p.x, p.y, p.z, 0.45f, 0.22f, 0.55f, 0xFFF0F0F0);
     } else if (style == 1) {
         /* spiky hair */
-        rect(cx - 9, y - 5, 4, 8, 0xFF30D0FF);
-        rect(cx - 3, y - 9, 5, 12, 0xFF30D0FF);
-        rect(cx + 4, y - 5, 4, 8, 0xFF30D0FF);
+        p = J(-7, -1);  box(p.x, p.y, p.z, 0.2f, 0.4f, 0.3f, 0xFF30D0FF);
+        p = J(0, -3);   box(p.x, p.y, p.z, 0.25f, 0.6f, 0.3f, 0xFF30D0FF);
+        p = J(6, -1);   box(p.x, p.y, p.z, 0.2f, 0.4f, 0.3f, 0xFF30D0FF);
         /* headband */
-        rect(cx - 10, y + 3, 20, 3, 0xFFFFFFFF);
+        p = J(0, 4);    box(p.x, p.y, p.z, 1.05f, 0.15f, 1.05f, 0xFFFFFFFF);
         /* belt */
-        rect(cx - 5, y + 47, 10, 3, 0xFFFFFFFF);
+        p = J(0, 48);   box(p.x, p.y, p.z, 0.6f, 0.15f, 0.6f, 0xFFFFFFFF);
         /* boots */
-        rect(l1x - 3, l1y - 2, 7, 4, 0xFF202020);
-        rect(l2x - 3, l2y - 2, 7, 4, 0xFF202020);
+        p = J(l1x, l1y); box(p.x, p.y, p.z, 0.45f, 0.22f, 0.55f, 0xFF202020);
+        p = J(l2x, l2y); box(p.x, p.y, p.z, 0.45f, 0.22f, 0.55f, 0xFF202020);
     } else {
-        /* heavy: thick torso, shoulder pads, mohawk, big belt */
-        line(cx, y + 22, cx, y + 48, 9, col);
-        rect(cx - 15, y + 22, 30, 6, 0xFF909090);
-        rect(cx - 2, y - 9, 5, 11, 0xFF2080FF);
-        rect(cx - 7, y + 46, 14, 4, 0xFF30D0FF);
-        rect(l1x - 4, l1y - 2, 9, 5, 0xFF303030);
-        rect(l2x - 4, l2y - 2, 9, 5, 0xFF303030);
+        /* heavy: shoulder pads, mohawk, big belt */
+        p = J(0, 25);   box(p.x, p.y, p.z, 1.7f, 0.3f, 1.2f, 0xFF909090);
+        p = J(0, -3);   box(p.x, p.y, p.z, 0.25f, 0.6f, 0.35f, 0xFF2080FF);
+        p = J(0, 48);   box(p.x, p.y, p.z, 0.8f, 0.2f, 0.95f, 0xFF30D0FF);
+        p = J(l1x, l1y); box(p.x, p.y, p.z, 0.5f, 0.25f, 0.65f, 0xFF303030);
+        p = J(l2x, l2y); box(p.x, p.y, p.z, 0.5f, 0.25f, 0.65f, 0xFF303030);
     }
+    g_flat = 0;
+#undef J
 }
 
 static void draw_fallen(int x, uint32_t col) {
-    disc(x + 8, GROUND - 10, 10, col);
-    line(x + 18, GROUND - 8, x + 55, GROUND - 8, 4, col);
-    line(x + 55, GROUND - 8, x + 75, GROUND - 14, 4, col);
-    line(x + 55, GROUND - 8, x + 75, GROUND - 2, 4, col);
-    line(x + 25, GROUND - 8, x + 35, GROUND - 22, 4, col);
+    g_flat = 0;
+    V3 hd = wp((float)x + 8.0f, (float)GROUND - 10.0f, 0.0f);
+    box(hd.x, hd.y, hd.z, 1.0f, 1.0f, 1.0f, col);
+    limb(wp(x + 18.0f, GROUND - 8.0f, 0), wp(x + 55.0f, GROUND - 8.0f, 0), 0.5f, 0.6f, col);
+    limb(wp(x + 55.0f, GROUND - 8.0f, 0), wp(x + 75.0f, GROUND - 14.0f, 0), 0.4f, 0.4f, col);
+    limb(wp(x + 55.0f, GROUND - 8.0f, 0), wp(x + 75.0f, GROUND - 2.0f, 0), 0.4f, 0.4f, col);
+    limb(wp(x + 25.0f, GROUND - 8.0f, 0), wp(x + 35.0f, GROUND - 22.0f, 0), 0.36f, 0.36f, col);
 }
 
+static void draw_shield(float xpx, float ypx) {
+    V3 p = wp(xpx, ypx, 0.0f);
+    g_flat = 1;
+    box(p.x, p.y, p.z, 0.3f, 2.5f, 1.5f, 0xFF00E0FF);
+    g_flat = 0;
+}
+
+/* =====================================================================
+   Frame control
+   ===================================================================== */
+static int drawoff = 0;
+
+static void begin_frame(void) {
+    sceGuStart(GU_DIRECT, list);
+    sceGuClearColor(0xFF2A0C06);
+    sceGuClearDepth(0);
+    sceGuClear(GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT);
+    sceGuEnable(GU_DEPTH_TEST);
+}
+
+static void end_frame(void) {
+    sceGuFinish();
+    sceGuSync(0, 0);
+    flush_text(drawoff);
+    sceDisplayWaitVblankStart();
+    sceGuSwapBuffers();
+    drawoff = (drawoff == 0) ? 0x88000 : 0;
+}
+
+static void init_gu(void) {
+    sceGuInit();
+    sceGuStart(GU_DIRECT, list);
+    sceGuDrawBuffer(GU_PSM_8888, (void *)0, BUF_W);
+    sceGuDispBuffer(SCR_W, SCR_H, (void *)0x88000, BUF_W);
+    sceGuDepthBuffer((void *)0x110000, BUF_W);
+    sceGuOffset(2048 - (SCR_W / 2), 2048 - (SCR_H / 2));
+    sceGuViewport(2048, 2048, SCR_W, SCR_H);
+    sceGuDepthRange(0xc350, 0x2710);
+    sceGuScissor(0, 0, SCR_W, SCR_H);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDepthFunc(GU_GEQUAL);
+    sceGuEnable(GU_DEPTH_TEST);
+    sceGuFrontFace(GU_CW);
+    sceGuShadeModel(GU_SMOOTH);
+    sceGuEnable(GU_BLEND);
+    sceGuBlendFunc(GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA, 0, 0);
+    sceGuEnable(GU_CLIP_PLANES);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceDisplayWaitVblankStart();
+    sceGuDisplay(GU_TRUE);
+}
+
+/* =====================================================================
+   main
+   ===================================================================== */
 int main(void) {
     setup_callbacks();
     pspDebugScreenInit();
     pspDebugScreenEnableBackColor(0);
+    init_gu();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
@@ -362,6 +676,8 @@ int main(void) {
         prev = pad.Buttons;
         frame++;
 
+        begin_frame();
+
         /* ================= TITLE ================= */
         if (state == 0) {
             if ((pressed & PSP_CTRL_LEFT)  && pc > 0) pc--;
@@ -377,8 +693,15 @@ int main(void) {
                 state = 1;
             }
 
-            ox = 0; oy = 0;
+            set_camera(v3(sinf(frame * 0.012f) * 2.0f, 3.2f, 17.0f), v3(0.0f, 2.2f, 0.0f));
             draw_stage(frame);
+            for (int i = 0; i < 3; i++) {
+                float wx = (cfx[i] + 20 - 240) / 20.0f;
+                shadow(wx, 0.0f);
+                draw_fighter(cfx[i], GROUND - 80, 1, ccol[i], 0, 0, pc == i, frame, i, 0.0f);
+            }
+
+            sceGuDisable(GU_DEPTH_TEST);
             rect(0, 10, W, 84, 0xFF000000);
             textx(240, 2, 0xFF00E0FF, "JOJO FIGHTER");
             textx(240, 4, 0xFFFFFFFF, "CHOOSE YOUR FIGHTER");
@@ -391,31 +714,34 @@ int main(void) {
                 textx(240, 10, 0xFF30FF30, "PRESS X TO START");
 
             for (int i = 0; i < 3; i++) {
-                draw_fighter(cfx[i], GROUND - 80, 1, ccol[i], 0, 0, pc == i, frame, i);
-                textx(cfx[i] + 20, 12, 0xFFFFFFFF, cname[i]);
-                textx(cfx[i] + 20, 14, 0xFFB0B0B0, cdesc[i]);
+                float wx = (cfx[i] + 20 - 240) / 20.0f;
+                int gx, gy;
+                project(wx, 0.0f, 0.0f, &gx, &gy);
+                textx(gx, gy / 8 + 1, 0xFFFFFFFF, cname[i]);
+                textx(gx, gy / 8 + 3, 0xFFB0B0B0, cdesc[i]);
             }
 
             /* selection box */
             {
-                int sx = cfx[pc] - 15;
-                int top = GROUND - 98;
+                float wx = (cfx[pc] + 20 - 240) / 20.0f;
+                int ax, ay, bx_, by_;
                 uint32_t sc = 0xFF00E0FF;
-                rect(sx, top, 70, 3, sc);
-                rect(sx, GROUND + 4, 70, 3, sc);
-                rect(sx, top, 3, GROUND + 7 - top, sc);
-                rect(sx + 67, top, 3, GROUND + 7 - top, sc);
+                project(wx - 1.9f, -0.4f, 0.0f, &ax, &by_);
+                project(wx + 1.9f, 5.0f, 0.0f, &bx_, &ay);
+                rect(ax, ay, bx_ - ax, 3, sc);
+                rect(ax, by_, bx_ - ax, 3, sc);
+                rect(ax, ay, 3, by_ - ay, sc);
+                rect(bx_ - 3, ay, 3, by_ - ay + 3, sc);
             }
 
-            textx(240, 31, 0xFFD0D0D0, "UP/DOWN: LEVEL   SQUARE: MODE");
-            textx(240, 33, 0xFFD0D0D0, "SQ/TRI PUNCH  X/O KICK  UP JUMP  L BLOCK");
+            textx(240, 27, 0xFFD0D0D0, "UP/DOWN: LEVEL   SQUARE: MODE");
+            textx(240, 29, 0xFFD0D0D0, "SQ/TRI PUNCH  X/O KICK  UP JUMP  L BLOCK");
         }
 
         /* ================= FIGHT ================= */
         else if (state == 1) {
 
             if (paused == 1) {
-                /* ---- pause menu input ---- */
                 if (pressed & PSP_CTRL_UP)   pcur = (pcur + 3) % 4;
                 if (pressed & PSP_CTRL_DOWN) pcur = (pcur + 1) % 4;
                 if (pressed & PSP_CTRL_START) paused = 0;
@@ -529,7 +855,6 @@ int main(void) {
 
                     /* ---------- enemy ---------- */
                     if (training) {
-                        /* passive dummy */
                         eface = (px >= ex) ? 1 : -1;
                         ewalk = 0; eatk = 0; esp = 0; eblock = 0;
                     } else {
@@ -658,48 +983,62 @@ int main(void) {
                 }
             }
 
-            /* ---------------- draw fight ---------------- */
-            ox = 0; oy = 0;
+            /* ---------------- draw fight (3D) ---------------- */
+            {
+                float midpx = ((px + 20) + (ex + 20)) * 0.5f;
+                float midx = (midpx - 240.0f) / 20.0f;
+                float sep = (float)((px > ex) ? (px - ex) : (ex - px)) / 20.0f;
+                float dist = 11.0f + sep * 0.3f;
+                float camx = midx * 0.6f;
+                float shx = 0.0f, shy = 0.0f;
+                if (shake > 0) {
+                    shx = ((frame & 1) ? 1.0f : -1.0f) * shake * 0.04f;
+                    shy = ((frame & 2) ? 1.0f : -1.0f) * shake * 0.03f;
+                    if (!paused) shake--;
+                }
+                set_camera(v3(camx + shx, 3.6f + shy, dist), v3(camx, 2.4f, 0.0f));
+            }
             draw_stage(frame);
 
-            if (shake > 0) {
-                ox = (frame & 1) ? shake / 2 : -(shake / 2);
-                oy = (frame & 2) ? shake / 3 : -(shake / 3);
-                if (!paused) shake--;
-            }
+            float pwx = (px + 20 - 240) / 20.0f;
+            float ewx = (ex + 20 - 240) / 20.0f;
 
             /* player side */
             if (ko > 0 && !pwon && !timeup) {
                 draw_fallen(px, ccol[pc]);
             } else if (ko > 0 && !pwon && timeup) {
-                draw_fighter(px, py, pface, ccol[pc], 0, 0, 0, frame, pc);
+                shadow(pwx, 0.0f);
+                draw_fighter(px, py, pface, ccol[pc], 0, 0, 0, frame, pc, 0.0f);
             } else {
+                shadow(pwx, (GROUND - 80 - py) / 20.0f);
                 if (psp > 0)
                     draw_fighter(px + pface * 35, py, pface, 0xFFE030A0,
-                                 ((psp / 3) % 2) ? 1 : 0, 0, 0, frame, 3);
+                                 ((psp / 3) % 2) ? 1 : 0, 0, 0, frame, 3, -0.9f);
                 draw_fighter(px, py, pface, pflash ? 0xFFFFFFFF : ccol[pc],
-                             patk, pblock, pwalk, frame, pc);
-                if (pblock) rect((pface == 1) ? px + 40 : px - 8, py + 15, 8, 50, 0xFFFFE000);
+                             patk, pblock, pwalk, frame, pc, 0.0f);
+                if (pblock) draw_shield((pface == 1) ? px + 44.0f : px - 4.0f, py + 40.0f);
             }
 
             /* enemy side */
             if (ko > 0 && pwon && !timeup) {
                 draw_fallen(ex, ccol[ec]);
             } else if (ko > 0 && pwon && timeup) {
-                draw_fighter(ex, GROUND - 80, eface, ccol[ec], 0, 0, 0, frame, ec);
+                shadow(ewx, 0.0f);
+                draw_fighter(ex, GROUND - 80, eface, ccol[ec], 0, 0, 0, frame, ec, 0.0f);
             } else {
+                shadow(ewx, 0.0f);
                 if (esp > 0)
                     draw_fighter(ex + eface * 35, GROUND - 80, eface, 0xFF40E060,
-                                 ((esp / 3) % 2) ? 1 : 0, 0, 0, frame, 3);
+                                 ((esp / 3) % 2) ? 1 : 0, 0, 0, frame, 3, -0.9f);
                 draw_fighter(ex, GROUND - 80, eface, eflash ? 0xFFFFFFFF : ccol[ec],
-                             eatk, eblock > 0, ewalk, frame, ec);
-                if (eblock > 0) rect((eface == 1) ? ex + 40 : ex - 8, GROUND - 65, 8, 50, 0xFFFFE000);
+                             eatk, eblock > 0, ewalk, frame, ec, 0.0f);
+                if (eblock > 0) draw_shield((eface == 1) ? ex + 44.0f : ex - 4.0f, GROUND - 40.0f);
             }
 
             draw_sparks();
 
-            /* ---- UI (no shake) ---- */
-            ox = 0; oy = 0;
+            /* ---- UI (2D) ---- */
+            sceGuDisable(GU_DEPTH_TEST);
 
             /* health bars */
             rect(20, 10, 200, 14, 0xFF000000);
@@ -717,11 +1056,9 @@ int main(void) {
                 textx(240, 4, 0xFF30FF30, "TRAINING");
                 textx(240, 6, 0xFFB0B0B0, "START: PAUSE");
             } else {
-                /* round wins */
                 for (int i = 0; i < pwins && i < 2; i++) disc(26 + i * 14, 46, 4, 0xFF00E0FF);
                 for (int i = 0; i < ewins && i < 2; i++) disc(W - 26 - i * 14, 46, 4, 0xFF00E0FF);
 
-                /* round timer */
                 int secs = (rtime + 59) / 60;
                 buf[0] = '0' + secs / 10;
                 buf[1] = '0' + secs % 10;
@@ -733,11 +1070,18 @@ int main(void) {
             if (pcombo >= 2) { combo_str(buf, pcombo); textx(60, 8, 0xFF00E0FF, buf); }
             if (ecombo >= 2) { combo_str(buf, ecombo); textx(420, 8, 0xFF00E0FF, buf); }
 
-            /* Stand shouts */
-            if (psp > 0 && (frame / 4) % 2 == 0)
-                textx(px + 20, (py - 16) / 8, 0xFFE030A0, "ORA ORA ORA!");
-            if (esp > 0 && (frame / 4) % 2 == 0)
-                textx(ex + 20, (GROUND - 96) / 8, 0xFF40E060, "MUDA MUDA!");
+            /* Stand shouts (placed above the fighter's head) */
+            {
+                int sx2, sy2;
+                if (psp > 0 && (frame / 4) % 2 == 0) {
+                    project(pwx, (GROUND - py) / 20.0f + 1.2f, 0.0f, &sx2, &sy2);
+                    textx(sx2, sy2 / 8, 0xFFE030A0, "ORA ORA ORA!");
+                }
+                if (esp > 0 && (frame / 4) % 2 == 0) {
+                    project(ewx, 5.2f, 0.0f, &sx2, &sy2);
+                    textx(sx2, sy2 / 8, 0xFF40E060, "MUDA MUDA!");
+                }
+            }
 
             /* K.O. / TIME UP banner */
             if (ko > 0) {
@@ -766,6 +1110,7 @@ int main(void) {
                 opt[1] = training ? "RESET POSITIONS" : "RESTART MATCH";
                 opt[2] = "MOVE LIST";
                 opt[3] = "QUIT TO TITLE";
+                rect(0, 0, W, H, 0x99000000);
                 rect(130, 46, 220, 160, 0xFF000000);
                 rect(130, 46, 220, 2, 0xFF00E0FF);
                 rect(130, 204, 220, 2, 0xFF00E0FF);
@@ -779,6 +1124,7 @@ int main(void) {
                 }
                 textx(240, 21, 0xFFB0B0B0, "UP/DOWN + X");
             } else if (paused == 2) {
+                rect(0, 0, W, H, 0x99000000);
                 rect(110, 30, 260, 200, 0xFF000000);
                 rect(110, 30, 260, 2, 0xFF00E0FF);
                 rect(110, 228, 260, 2, 0xFF00E0FF);
@@ -805,25 +1151,27 @@ int main(void) {
                 state = 0;
             }
 
-            ox = 0; oy = 0;
+            set_camera(v3(sinf(frame * 0.01f) * 3.0f, 3.4f, 13.0f), v3(0.0f, 2.2f, 0.0f));
             draw_stage(frame);
-            rect(0, 70, W, 70, 0xFF000000);
-
             if (matchwon) {
-                textx(240, 10, 0xFF30FF30, "YOU WIN THE MATCH!");
-                draw_fighter(220, GROUND - 80, 1, ccol[pc], 0, 0, 0, frame, pc);
+                shadow(0.0f, 0.0f);
+                draw_fighter(220, GROUND - 80, 1, ccol[pc], 0, 0, 0, frame, pc, 0.0f);
             } else {
-                textx(240, 10, 0xFF3030FF, "YOU LOST THE MATCH");
                 draw_fallen(210, ccol[pc]);
             }
+
+            sceGuDisable(GU_DEPTH_TEST);
+            rect(0, 40, W, 60, 0xFF000000);
+            if (matchwon) textx(240, 6, 0xFF30FF30, "YOU WIN THE MATCH!");
+            else          textx(240, 6, 0xFF3030FF, "YOU LOST THE MATCH");
             buf[0] = '0' + pwins; buf[1] = ' '; buf[2] = '-'; buf[3] = ' ';
             buf[4] = '0' + ewins; buf[5] = 0;
-            textx(240, 13, 0xFF00E0FF, buf);
+            textx(240, 9, 0xFF00E0FF, buf);
             if (mt > 40 && (frame / 30) % 2 == 0)
-                textx(240, 28, 0xFF30FF30, "PRESS X FOR TITLE SCREEN");
+                textx(240, 27, 0xFF30FF30, "PRESS X FOR TITLE SCREEN");
         }
 
-        sceDisplayWaitVblankStart();
+        end_frame();
     }
     return 0;
 }
