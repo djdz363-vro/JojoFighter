@@ -1,5 +1,4 @@
 #include <pspkernel.h>
-#include <pspdebug.h>
 #include <pspdisplay.h>
 #include <pspctrl.h>
 #include <pspgu.h>
@@ -145,8 +144,64 @@ static void line(int x0, int y0, int x1, int y1, int t, uint32_t c) {
 }
 
 /* =====================================================================
-   Text (queued, printed after the GPU finishes the frame)
+   Text: tiny 5x7 pixel font drawn by the GPU (no debug screen needed)
    ===================================================================== */
+static const char CS[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!+-.:/><()";
+static const unsigned char FONT[47][7] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* space */
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, /* A */
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, /* B */
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, /* C */
+    {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}, /* D */
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, /* E */
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}, /* F */
+    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}, /* G */
+    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}, /* H */
+    {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}, /* I */
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0C}, /* J */
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, /* K */
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, /* L */
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, /* M */
+    {0x11,0x11,0x19,0x15,0x13,0x11,0x11}, /* N */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* O */
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, /* P */
+    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, /* Q */
+    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}, /* R */
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, /* S */
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, /* T */
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, /* U */
+    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}, /* V */
+    {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}, /* W */
+    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, /* X */
+    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, /* Y */
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}, /* Z */
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, /* 0 */
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, /* 1 */
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, /* 2 */
+    {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, /* 3 */
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, /* 4 */
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, /* 5 */
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, /* 6 */
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, /* 7 */
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, /* 8 */
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, /* 9 */
+    {0x04,0x04,0x04,0x04,0x04,0x00,0x04}, /* ! */
+    {0x00,0x04,0x04,0x1F,0x04,0x04,0x00}, /* + */
+    {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}, /* - */
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}, /* . */
+    {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00}, /* : */
+    {0x01,0x02,0x02,0x04,0x08,0x08,0x10}, /* / */
+    {0x10,0x08,0x04,0x02,0x04,0x08,0x10}, /* > */
+    {0x01,0x02,0x04,0x08,0x04,0x02,0x01}, /* < */
+    {0x02,0x04,0x08,0x08,0x08,0x04,0x02}, /* ( */
+    {0x08,0x04,0x02,0x02,0x02,0x04,0x08}  /* ) */
+};
+
+static const unsigned char *glyph(char c) {
+    for (int i = 0; CS[i]; i++) if (CS[i] == c) return FONT[i];
+    return FONT[0];
+}
+
 typedef struct { int col, row; uint32_t color; char s[48]; } Txt;
 static Txt txq[96];
 static int ntx = 0;
@@ -174,13 +229,40 @@ static void textl(int col, int row, uint32_t color, const char *s) {
     qtext(col, row, color, s);
 }
 
-static void flush_text(int offset) {
-    pspDebugScreenSetOffset(offset);
+static void flush_text(void) {
+    if (ntx == 0) return;
+    sceGuDisable(GU_DEPTH_TEST);
+
+    int total = 0;
     for (int i = 0; i < ntx; i++) {
-        pspDebugScreenSetTextColor(txq[i].color);
-        pspDebugScreenSetXY(txq[i].col, txq[i].row);
-        pspDebugScreenPrintf("%s", txq[i].s);
+        for (int c = 0; txq[i].s[c]; c++) {
+            const unsigned char *g = glyph(txq[i].s[c]);
+            for (int r = 0; r < 7; r++)
+                for (int b = 0; b < 5; b++)
+                    if (g[r] & (0x10 >> b)) total++;
+        }
     }
+    if (total == 0) { ntx = 0; return; }
+
+    Vtx *v = (Vtx *)sceGuGetMemory(total * 2 * sizeof(Vtx));
+    int k = 0;
+    for (int i = 0; i < ntx; i++) {
+        for (int c = 0; txq[i].s[c]; c++) {
+            const unsigned char *g = glyph(txq[i].s[c]);
+            int x0 = (txq[i].col + c) * 7;
+            int y0 = txq[i].row * 8 + 1;
+            for (int r = 0; r < 7; r++) {
+                for (int b = 0; b < 5; b++) {
+                    if (!(g[r] & (0x10 >> b))) continue;
+                    int x = x0 + b;
+                    if (x >= SCR_W) continue;
+                    v[k].color = txq[i].color; v[k].x = (float)x;       v[k].y = (float)(y0 + r);       v[k].z = 0; k++;
+                    v[k].color = txq[i].color; v[k].x = (float)(x + 1); v[k].y = (float)(y0 + r + 1);   v[k].z = 0; k++;
+                }
+            }
+        }
+    }
+    if (k > 0) sceGuDrawArray(GU_SPRITES, VT2, k, 0, v);
     ntx = 0;
 }
 
@@ -340,6 +422,7 @@ static void set_camera(V3 eye, V3 ctr) {
     sceGumLookAt(&e, &c, &u);
     sceGumMatrixMode(GU_MODEL);
     sceGumLoadIdentity();
+    sceGumUpdateMatrix();   /* send the camera to the GPU (this was missing) */
 }
 
 /* world point -> screen pixel (for text placement) */
@@ -450,7 +533,7 @@ static void draw_stage(int frame) {
         for (float y = 1.5f; y < h - 1.0f; y += 2.0f) {
             for (int c = 0; c < 3; c++) {
                 float wx = x - 1.5f + c * 1.5f;
-                if (((b * 7 + c * 3 + (int)y * 5) % 5) < 2)
+                if (((b * 7 + c * 3 + (int)y * 5) % 5) < 2 && n + 6 <= 150)
                     quadxy(v, &n, wx - 0.3f, y - 0.35f, wx + 0.3f, y + 0.35f, -23.8f, 0xFF40C8F0);
             }
         }
@@ -529,10 +612,10 @@ static void draw_fighter(int x, int y, int face, uint32_t col,
 
     if (style == 0) {
         /* cap + brim */
-        p = J(0, -1);       box(p.x, p.y, p.z, 1.1f, 0.35f, 1.1f, 0xFFF0F0F0);
+        p = J(0, -1);        box(p.x, p.y, p.z, 1.1f, 0.35f, 1.1f, 0xFFF0F0F0);
         p = J(face * 10, 3); box(p.x, p.y, p.z, 0.6f, 0.15f, 0.95f, 0xFFF0F0F0);
         /* scarf + fluttering tail */
-        p = J(0, 21);       box(p.x, p.y, p.z, 0.95f, 0.22f, 0.8f, 0xFF2020E0);
+        p = J(0, 21);        box(p.x, p.y, p.z, 0.95f, 0.22f, 0.8f, 0xFF2020E0);
         {
             float wob = (float)(((frame / 5) % 2) * 3);
             float th = (12.0f + wob) / 20.0f;
@@ -588,8 +671,6 @@ static void draw_shield(float xpx, float ypx) {
 /* =====================================================================
    Frame control
    ===================================================================== */
-static int drawoff = 0;
-
 static void begin_frame(void) {
     sceGuStart(GU_DIRECT, list);
     sceGuClearColor(0xFF2A0C06);
@@ -599,12 +680,11 @@ static void begin_frame(void) {
 }
 
 static void end_frame(void) {
+    flush_text();
     sceGuFinish();
     sceGuSync(0, 0);
-    flush_text(drawoff);
     sceDisplayWaitVblankStart();
     sceGuSwapBuffers();
-    drawoff = (drawoff == 0) ? 0x88000 : 0;
 }
 
 static void init_gu(void) {
@@ -636,8 +716,6 @@ static void init_gu(void) {
    ===================================================================== */
 int main(void) {
     setup_callbacks();
-    pspDebugScreenInit();
-    pspDebugScreenEnableBackColor(0);
     init_gu();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
@@ -1139,7 +1217,7 @@ int main(void) {
                 textl(18, 18, 0xFFFFFFFF, "L (HOLD)  BLOCK");
                 textl(18, 20, 0xFFFFFFFF, "R         STAND RUSH");
                 textx(240, 22, 0xFFB0B0B0, "(NEEDS A FULL METER)");
-                textx(240, 24, 0xFF30D0FF, "HEAVY = MORE DAMAGE, SLOWER");
+                textx(240, 24, 0xFF30D0FF, "HEAVY HITS HARDER BUT SLOWER");
                 textx(240, 26, 0xFF30FF30, "PRESS X TO GO BACK");
             }
         }
