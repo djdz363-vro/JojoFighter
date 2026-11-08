@@ -61,6 +61,7 @@ static const int mstart[5] = {0, 3, 8, 5, 12};
 static const int mkb[5]    = {0, 8, 20, 12, 30};
 static const int mshk[5]   = {0, 3, 7, 4, 11};
 static const int mmtr[5]   = {0, 6, 12, 7, 13};
+static const int mhs[5]    = {0, 4, 9, 6, 11};   /* HIT-STOP frames per move */
 
 static int movedmg(int type, int ch) {
     int base = (type <= 2) ? cpun[ch] : ckick[ch];
@@ -858,6 +859,134 @@ static void draw_sparks(void) {
     g_flat = 0;
 }
 
+/* =====================================================================
+   IMPACT EFFECTS: hit-stop, particles, shockwave rings, screen flash
+   ===================================================================== */
+typedef struct { float x, y, vx, vy; int t, tmax; uint32_t c; float sz; } Part;
+static Part parts[48];
+typedef struct { float x, y; int t, tmax; float r; uint32_t c; } Wave;
+static Wave waves[4];
+
+static int hitstop = 0;    /* frames left of freeze */
+static int hitmax = 1;     /* length of the current freeze */
+static int hitvic = 0;     /* who got hit: 1 = enemy, 2 = player */
+static int hitamp = 0;     /* how hard the victim vibrates (pixels) */
+static int flashscr = 0;   /* white screen flash */
+
+/* x,y = impact point (old pixel coords). dir = attacker facing (+1/-1).
+   power: 0 tiny, 1 light, 3 heavy, 4 K.O.  victim: 1 enemy, 2 player. */
+static void hitfx(int x, int y, int dir, int power, int block, int victim, int stop) {
+    static const uint32_t hot[4]  = {0xFF30D0FF, 0xFFFFFFFF, 0xFF30A0FF, 0xFF2828FF};
+    static const uint32_t cool[3] = {0xFFFFE0A0, 0xFFFFFFFF, 0xFFE0C080};
+
+    add_spark(x, y, block ? 2 : (power >= 3 ? 1 : 0));
+
+    int n = block ? 4 : 5 + power * 4;
+    for (int i = 0; i < 48 && n > 0; i++) {
+        if (parts[i].t > 0) continue;
+        n--;
+        float a = ((float)(rnd() % 200) / 100.0f - 1.0f) * 1.3f;
+        float sp = 1.2f + (float)(rnd() % 100) / 100.0f * (1.5f + (float)power);
+        parts[i].x = (float)x;
+        parts[i].y = (float)y;
+        parts[i].vx = (float)dir * cosf(a) * sp;
+        parts[i].vy = sinf(a) * sp - 0.8f;
+        parts[i].tmax = 16 + rnd() % 14 + power * 3;
+        parts[i].t = parts[i].tmax;
+        parts[i].sz = (block ? 1.2f : 1.5f) + (float)power * 0.5f + (float)(rnd() % 10) / 10.0f;
+        parts[i].c = block ? cool[rnd() % 3] : hot[rnd() % 4];
+    }
+
+    if (!block && power >= 1) {
+        for (int i = 0; i < 4; i++) {
+            if (waves[i].t > 0) continue;
+            waves[i].x = (float)x;
+            waves[i].y = (float)y;
+            waves[i].tmax = 10 + power * 2;
+            waves[i].t = waves[i].tmax;
+            waves[i].r = (power >= 3) ? 3.4f : 1.8f;
+            waves[i].c = (power >= 3) ? 0xFFFFFFFF : 0xFF30D0FF;
+            break;
+        }
+    }
+
+    if (stop > 0) {
+        if (stop > hitstop) { hitstop = stop; hitmax = stop; }
+        hitvic = victim;
+        hitamp = block ? 1 : ((power >= 3) ? 3 : 2);
+    }
+    if (!block && power >= 3 && flashscr < 3) flashscr = 3;
+}
+
+static void update_fx(void) {
+    for (int i = 0; i < 48; i++) {
+        if (parts[i].t <= 0) continue;
+        parts[i].x += parts[i].vx;
+        parts[i].y += parts[i].vy;
+        parts[i].vy += 0.18f;
+        parts[i].vx *= 0.97f;
+        if (parts[i].y > GROUND - 2) { parts[i].y = GROUND - 2; parts[i].vy *= -0.4f; }
+        parts[i].t--;
+    }
+    for (int i = 0; i < 4; i++) if (waves[i].t > 0) waves[i].t--;
+}
+
+static void clear_fx(void) {
+    for (int i = 0; i < 48; i++) parts[i].t = 0;
+    for (int i = 0; i < 4; i++) waves[i].t = 0;
+    for (int i = 0; i < 8; i++) sparks[i].t = 0;
+    hitstop = 0; hitmax = 1; hitvic = 0; hitamp = 0; flashscr = 0;
+}
+
+static void draw_fx(void) {
+    bind_tex(-1);
+
+    /* particles: small camera-facing squares that fade out */
+    int cnt = 0;
+    for (int i = 0; i < 48; i++) if (parts[i].t > 0) cnt++;
+    if (cnt > 0) {
+        Vtx *v = (Vtx *)sceGuGetMemory(cnt * 6 * sizeof(Vtx));
+        int k = 0;
+        for (int i = 0; i < 48; i++) {
+            if (parts[i].t <= 0) continue;
+            float wx = (parts[i].x - 240.0f) / 20.0f;
+            float wy = ((float)GROUND - parts[i].y) / 20.0f;
+            float life = (float)parts[i].t / (float)parts[i].tmax;
+            float s = parts[i].sz * 0.06f * (0.4f + 0.6f * life);
+            float af = life * 2.0f;
+            if (af > 1.0f) af = 1.0f;
+            uint32_t a = (uint32_t)(255.0f * af);
+            uint32_t col = (a << 24) | (parts[i].c & 0x00FFFFFF);
+            quadxy(v, &k, wx - s, wy - s, wx + s, wy + s, 1.4f, col);
+        }
+        sceGuDrawArray(GU_TRIANGLES, VT3, k, 0, v);
+    }
+
+    /* shockwave rings */
+    for (int i = 0; i < 4; i++) {
+        Wave *w = &waves[i];
+        if (w->t <= 0) continue;
+        float prog = 1.0f - (float)w->t / (float)w->tmax;
+        float r = w->r * (0.2f + 0.8f * prog);
+        float th = 0.08f + 0.22f * (1.0f - prog);
+        uint32_t a = (uint32_t)(230.0f * (1.0f - prog));
+        uint32_t col = (a << 24) | (w->c & 0x00FFFFFF);
+        float wx = (w->x - 240.0f) / 20.0f;
+        float wy = ((float)GROUND - w->y) / 20.0f;
+        int n = 20;
+        Vtx *v = (Vtx *)sceGuGetMemory((n + 1) * 2 * sizeof(Vtx));
+        for (int s = 0; s <= n; s++) {
+            float an = s * 6.2831853f / n;
+            float cs = cosf(an), sn = sinf(an);
+            v[s * 2].color = col;
+            v[s * 2].x = wx + cs * (r - th); v[s * 2].y = wy + sn * (r - th); v[s * 2].z = 1.2f;
+            v[s * 2 + 1].color = col;
+            v[s * 2 + 1].x = wx + cs * (r + th); v[s * 2 + 1].y = wy + sn * (r + th); v[s * 2 + 1].z = 1.2f;
+        }
+        sceGuDrawArray(GU_TRIANGLE_STRIP, VT3, (n + 1) * 2, 0, v);
+    }
+}
+
 /* ---------- 3D stage ---------- */
 static void draw_stage(int frame) {
     g_flat = 0;
@@ -1169,6 +1298,7 @@ int main(int argc, char **argv) {
     int pcombo = 0, pcc = 0, ecombo = 0, ecc = 0;
     int shake = 0, rtime = ROUNDTIME;
     int frame = 0;
+    unsigned int ibuf = 0;   /* buttons pressed during a hit-stop freeze */
     char buf[64];
     SceCtrlData pad;
     unsigned int prev = 0;
@@ -1261,6 +1391,7 @@ int main(int argc, char **argv) {
 
         /* ================= FIGHT ================= */
         else if (state == 1) {
+            int frozen = 0;   /* 1 while a hit-stop freeze is running */
 
             if (paused == 1) {
                 if (pressed & PSP_CTRL_UP)   pcur = (pcur + 3) % 4;
@@ -1288,12 +1419,25 @@ int main(int argc, char **argv) {
                     ko = 0; timeup = 0;
                     pcombo = 0; pcc = 0; ecombo = 0; ecc = 0;
                     shake = 0; rtime = ROUNDTIME;
-                    for (int i = 0; i < 8; i++) sparks[i].t = 0;
+                    ibuf = 0;
+                    clear_fx();
                 }
 
-                for (int i = 0; i < 8; i++) if (sparks[i].t > 0) sparks[i].t--;
+                /* ---- hit-stop: freeze the fight, keep drawing ---- */
+                frozen = (hitstop > 0);
+                if (frozen) {
+                    hitstop--;
+                    ibuf |= pressed;          /* remember buttons pressed during the freeze */
+                } else {
+                    pressed |= ibuf;          /* ...and use them as soon as it ends */
+                    ibuf = 0;
+                    for (int i = 0; i < 8; i++) if (sparks[i].t > 0) sparks[i].t--;
+                    update_fx();
+                }
 
-                if (ko == 0) {
+                if (frozen) {
+                    /* time stands still */
+                } else if (ko == 0) {
                     if (pcc > 0 && --pcc == 0) pcombo = 0;
                     if (ecc > 0 && --ecc == 0) ecombo = 0;
                     if (rtime > 0) rtime--;
@@ -1340,12 +1484,14 @@ int main(int argc, char **argv) {
                                 if (eblock > 0) {
                                     int c = d / 5; if (c < 1) c = 1;
                                     ehp -= c; emeter += 2;
-                                    add_spark((eface == 1) ? ex + 44 : ex - 4, by2 + bh2 / 2, 2);
+                                    hitfx((eface == 1) ? ex + 44 : ex - 4, by2 + bh2 / 2,
+                                          pface, 0, 1, 1, mhs[patk] / 2);
                                     shake = 2;
                                 } else {
                                     ehp -= d; eflash = 6; pmeter += mmtr[patk]; emeter += 8;
                                     ex = clampx(ex + mkb[patk] * pface);
-                                    add_spark(ex + 20, by2 + bh2 / 2, (patk == 2 || patk == 4) ? 1 : 0);
+                                    hitfx(ex + 20, by2 + bh2 / 2, pface,
+                                          (patk == 2 || patk == 4) ? 3 : 1, 0, 1, mhs[patk]);
                                     shake = mshk[patk];
                                     pcombo = (pcc > 0) ? pcombo + 1 : 1;
                                     pcc = 70; ecombo = 0; ecc = 0;
@@ -1361,11 +1507,12 @@ int main(int argc, char **argv) {
                         if (psp % 6 == 0 && overlap(ax, py, 80, 80, ex, GROUND - 80, 40, 80)) {
                             if (eblock > 0) {
                                 ehp -= 1;
-                                add_spark((eface == 1) ? ex + 44 : ex - 4, py + 20 + rnd() % 40, 2);
+                                hitfx((eface == 1) ? ex + 44 : ex - 4, py + 20 + rnd() % 40,
+                                      pface, 0, 1, 1, 0);
                             } else {
                                 ehp -= 4; eflash = 4;
                                 ex = clampx(ex + 4 * pface);
-                                add_spark(ex + 20, py + 15 + rnd() % 50, 0);
+                                hitfx(ex + 20, py + 15 + rnd() % 50, pface, 0, 0, 1, 2);
                                 shake = 4;
                                 pcombo = (pcc > 0) ? pcombo + 1 : 1;
                                 pcc = 70; ecombo = 0; ecc = 0;
@@ -1424,12 +1571,14 @@ int main(int argc, char **argv) {
                                     if (pblock && pface == -eface) {
                                         int c = d / 5; if (c < 1) c = 1;
                                         php -= c; pmeter += 3; emeter += 2;
-                                        add_spark((pface == 1) ? px + 44 : px - 4, by2 + bh2 / 2, 2);
+                                        hitfx((pface == 1) ? px + 44 : px - 4, by2 + bh2 / 2,
+                                              eface, 0, 1, 2, mhs[eatk] / 2);
                                         shake = 2;
                                     } else {
                                         php -= d; pflash = 6; pmeter += 8; emeter += mmtr[eatk];
                                         px = clampx(px + mkb[eatk] * eface);
-                                        add_spark(px + 20, by2 + bh2 / 2, (eatk == 2 || eatk == 4) ? 1 : 0);
+                                        hitfx(px + 20, by2 + bh2 / 2, eface,
+                                              (eatk == 2 || eatk == 4) ? 3 : 1, 0, 2, mhs[eatk]);
                                         shake = mshk[eatk];
                                         ecombo = (ecc > 0) ? ecombo + 1 : 1;
                                         ecc = 70; pcombo = 0; pcc = 0;
@@ -1445,12 +1594,13 @@ int main(int argc, char **argv) {
                             if (esp % 6 == 0 && overlap(ax, GROUND - 80, 80, 80, px, py, 40, 80)) {
                                 if (pblock && pface == -eface) {
                                     php -= 1;
-                                    add_spark((pface == 1) ? px + 44 : px - 4, py + 20 + rnd() % 40, 2);
+                                    hitfx((pface == 1) ? px + 44 : px - 4, py + 20 + rnd() % 40,
+                                          eface, 0, 1, 2, 0);
                                 } else {
                                     php -= (4 * edmg[lvl] + 50) / 100;
                                     pflash = 4;
                                     px = clampx(px + 4 * eface);
-                                    add_spark(px + 20, py + 15 + rnd() % 50, 0);
+                                    hitfx(px + 20, py + 15 + rnd() % 50, eface, 0, 0, 2, 2);
                                     shake = 4;
                                     ecombo = (ecc > 0) ? ecombo + 1 : 1;
                                     ecc = 70; pcombo = 0; pcc = 0;
@@ -1487,7 +1637,18 @@ int main(int argc, char **argv) {
                         pblock = 0; pwalk = 0; ewalk = 0;
                         py = GROUND - 80; vy = 0;
                         pcombo = 0; ecombo = 0; pcc = 0; ecc = 0;
-                        if (!timeup) shake = 14;
+                        if (!timeup) {
+                            shake = 14;
+                            /* big K.O. freeze: loser flashes white, then falls */
+                            if (pwon) {
+                                hitfx(ex + 20, GROUND - 40, pface, 4, 0, 1, 26);
+                                eflash = 10;
+                            } else {
+                                hitfx(px + 20, GROUND - 40, eface, 4, 0, 2, 26);
+                                pflash = 10;
+                            }
+                            flashscr = 10;
+                        }
                     }
                 } else {
                     ko--;
@@ -1512,20 +1673,28 @@ int main(int argc, char **argv) {
                 float dist = 11.0f + sep * 0.3f;
                 float camx = midx * 0.6f;
                 float shx = 0.0f, shy = 0.0f;
+                /* camera punches in during a hit-stop freeze */
+                if (hitstop > 0 && hitmax > 0)
+                    dist -= ((hitmax > 6) ? 1.5f : 0.7f) * (float)hitstop / (float)hitmax;
                 if (shake > 0) {
                     shx = ((frame & 1) ? 1.0f : -1.0f) * shake * 0.04f;
                     shy = ((frame & 2) ? 1.0f : -1.0f) * shake * 0.03f;
-                    if (!paused) shake--;
+                    if (!paused && !frozen) shake--;   /* shake holds still while frozen */
                 }
                 set_camera(v3(camx + shx, 3.6f + shy, dist), v3(camx, 2.4f, 0.0f));
             }
             draw_stage(frame);
 
+            /* the victim vibrates during the freeze */
+            int vibx = (hitstop > 0) ? ((frame & 1) ? hitamp : -hitamp) : 0;
+            int dpx = px + ((hitvic == 2) ? vibx : 0);
+            int dex = ex + ((hitvic == 1) ? vibx : 0);
+
             float pwx = (px + 20 - 240) / 20.0f;
             float ewx = (ex + 20 - 240) / 20.0f;
 
             /* player side */
-            if (ko > 0 && !pwon && !timeup) {
+            if (ko > 0 && hitstop == 0 && !pwon && !timeup) {
                 draw_fallen(px, pc);
             } else if (ko > 0 && !pwon && timeup) {
                 shadow(pwx, 0.0f);
@@ -1537,12 +1706,12 @@ int main(int argc, char **argv) {
                     draw_fighter(px + pface * 35, py, pface, 0, ((psp / 3) % 2) ? 1 : 0,
                                  0, 0, frame, 3, -0.9f);
                 }
-                draw_fighter(px, py, pface, pflash > 0, patk, pblock, pwalk, frame, pc, 0.0f);
-                if (pblock) draw_shield((pface == 1) ? px + 44.0f : px - 4.0f, py + 40.0f);
+                draw_fighter(dpx, py, pface, pflash > 0, patk, pblock, pwalk, frame, pc, 0.0f);
+                if (pblock) draw_shield((pface == 1) ? dpx + 44.0f : dpx - 4.0f, py + 40.0f);
             }
 
             /* enemy side */
-            if (ko > 0 && pwon && !timeup) {
+            if (ko > 0 && hitstop == 0 && pwon && !timeup) {
                 draw_fallen(ex, ec);
             } else if (ko > 0 && pwon && timeup) {
                 shadow(ewx, 0.0f);
@@ -1554,14 +1723,21 @@ int main(int argc, char **argv) {
                     draw_fighter(ex + eface * 35, GROUND - 80, eface, 0, ((esp / 3) % 2) ? 1 : 0,
                                  0, 0, frame, 3, -0.9f);
                 }
-                draw_fighter(ex, GROUND - 80, eface, eflash > 0, eatk, eblock > 0, ewalk, frame, ec, 0.0f);
-                if (eblock > 0) draw_shield((eface == 1) ? ex + 44.0f : ex - 4.0f, GROUND - 40.0f);
+                draw_fighter(dex, GROUND - 80, eface, eflash > 0, eatk, eblock > 0, ewalk, frame, ec, 0.0f);
+                if (eblock > 0) draw_shield((eface == 1) ? dex + 44.0f : dex - 4.0f, GROUND - 40.0f);
             }
 
             draw_sparks();
+            draw_fx();
 
             /* ---- UI (2D) ---- */
             sceGuDisable(GU_DEPTH_TEST);
+
+            /* white screen flash on heavy hits and K.O. */
+            if (flashscr > 0) {
+                rect(0, 0, W, H, ((uint32_t)(flashscr * 14) << 24) | 0x00FFFFFF);
+                if (!paused) flashscr--;
+            }
 
             /* health bars */
             rect(20, 10, 200, 14, 0xFF000000);
@@ -1606,8 +1782,8 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* K.O. / TIME UP banner */
-            if (ko > 0) {
+            /* K.O. / TIME UP banner (shows after the K.O. freeze ends) */
+            if (ko > 0 && hitstop == 0) {
                 rect(0, 85, W, 100, 0xFF000000);
                 if (timeup) {
                     textx(240, 15, 0xFFFFFFFF, "TIME UP!");
