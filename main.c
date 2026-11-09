@@ -263,28 +263,30 @@ static void gen_legs(int t, uint32_t base, uint32_t accent) {
 }
 
 static void gen_ground(int t) {
+    /* dark polished marble with gold tile lines (Tekken-style arena floor) */
     for (int y = 0; y < TEXSZ; y++) {
         for (int x = 0; x < TEXSZ; x++) {
-            uint32_t c = tpx(30, 90, 40);
-            c = tadj(c, trnd() % 17 - 8);
-            if (((x / 32) + (y / 32)) & 1) c = tadj(c, -10);
-            if (x % 32 == 0 || y % 32 == 0) c = tpx(70, 140, 70);
+            uint32_t c = tpx(74, 40, 22);
+            c = tadj(c, trnd() % 13 - 6);
+            if (((x / 32) + (y / 32)) & 1) c = tadj(c, 14);
+            if ((x + y * 2) % 41 < 2) c = tadj(c, 22);
+            if (x % 32 < 2 || y % 32 < 2) c = tpx(214, 160, 64);
             tput(t, x, y, c);
         }
     }
-    for (int i = 0; i < 40; i++) tput(t, trnd() % TEXSZ, trnd() % TEXSZ, tpx(90, 160, 80));
+    for (int i = 0; i < 30; i++) tput(t, trnd() % TEXSZ, trnd() % TEXSZ, tpx(240, 200, 110));
 }
 
 static void gen_build(int t) {
-    for (int y = 0; y < TEXSZ; y++)
-        for (int x = 0; x < TEXSZ; x++)
-            tput(t, x, y, tadj(tpx(14, 10, 20), trnd() % 5 - 2));
-    for (int r = 0; r < 8; r++) {
-        for (int c = 0; c < 4; c++) {
-            int lit = (trnd() % 100) < 42;
-            uint32_t wc = lit ? tpx(240, 200, 64) : tpx(26, 28, 44);
-            tfill(t, 4 + c * 15, 3 + r * 8, 8, 5, wc);
-            if (lit) tfill(t, 6 + c * 15, 4 + r * 8, 4, 2, tpx(255, 235, 140));
+    /* warm sandstone wall with carved panels */
+    for (int y = 0; y < TEXSZ; y++) {
+        for (int x = 0; x < TEXSZ; x++) {
+            uint32_t c = tpx(132, 70, 38);
+            c = tadj(c, trnd() % 9 - 4);
+            if (x % 32 < 2) c = tpx(214, 160, 64);
+            if (y % 32 < 2) c = tpx(176, 116, 52);
+            if ((x % 32) > 6 && (x % 32) < 26 && (y % 32) > 6 && (y % 32) < 26) c = tadj(c, -16);
+            tput(t, x, y, c);
         }
     }
 }
@@ -691,12 +693,12 @@ static void disc3(float cx, float cy, float cz, float r, uint32_t c) {
 static void shadow(float wx, float height) {
     bind_tex(-1);
     float s = 1.3f / (1.0f + height * 0.35f);
-    uint32_t c = 0xFF0C200C;
+    uint32_t c = 0xFF0A0A14;
     Vtx *v = (Vtx *)sceGuGetMemory(4 * sizeof(Vtx));
-    v[0].color = c; v[0].x = wx - s; v[0].y = 0.03f; v[0].z = 0.9f;
-    v[1].color = c; v[1].x = wx + s; v[1].y = 0.03f; v[1].z = 0.9f;
-    v[2].color = c; v[2].x = wx + s; v[2].y = 0.03f; v[2].z = -0.9f;
-    v[3].color = c; v[3].x = wx - s; v[3].y = 0.03f; v[3].z = -0.9f;
+    v[0].color = c; v[0].x = wx - s; v[0].y = 0.10f; v[0].z = 0.9f;
+    v[1].color = c; v[1].x = wx + s; v[1].y = 0.10f; v[1].z = 0.9f;
+    v[2].color = c; v[2].x = wx + s; v[2].y = 0.10f; v[2].z = -0.9f;
+    v[3].color = c; v[3].x = wx - s; v[3].y = 0.10f; v[3].z = -0.9f;
     sceGuDrawArray(GU_TRIANGLE_FAN, VT3, 4, 0, v);
 }
 
@@ -987,47 +989,120 @@ static void draw_fx(void) {
     }
 }
 
-/* ---------- 3D stage ---------- */
+/* ---------- 3D stage: golden palace hall (Tekken-style arena) ---------- */
+#define STAGE_CX (-1.0f)    /* centre of the fighting ring (world x) */
+
+static void pillar(float cx, float cz, float r, float y0, float y1, uint32_t col) {
+    bind_tex(-1);
+    int n = 10;
+    Vtx *v = (Vtx *)sceGuGetMemory((unsigned int)(n + 1) * 2 * sizeof(Vtx));
+    for (int i = 0; i <= n; i++) {
+        float a = (float)i * 6.2831853f / (float)n;
+        float nx = cosf(a), nz = sinf(a);
+        uint32_t c = shadec(col, 0.35f + 0.65f * lit(nx, 0.0f, nz));
+        v[i * 2].color = c;
+        v[i * 2].x = cx + nx * r; v[i * 2].y = y0; v[i * 2].z = cz + nz * r;
+        v[i * 2 + 1].color = c;
+        v[i * 2 + 1].x = cx + nx * r; v[i * 2 + 1].y = y1; v[i * 2 + 1].z = cz + nz * r;
+    }
+    sceGuDrawArray(GU_TRIANGLE_STRIP, VT3, (n + 1) * 2, 0, v);
+}
+
+/* flat ring lying on the floor */
+static void floor_ring(float cx, float cz, float r0, float r1, float y, uint32_t c) {
+    bind_tex(-1);
+    int n = 48;
+    Vtx *v = (Vtx *)sceGuGetMemory((unsigned int)(n + 1) * 2 * sizeof(Vtx));
+    for (int i = 0; i <= n; i++) {
+        float a = (float)i * 6.2831853f / (float)n;
+        float ca = cosf(a), sa = sinf(a);
+        v[i * 2].color = c;
+        v[i * 2].x = cx + ca * r0; v[i * 2].y = y; v[i * 2].z = cz + sa * r0;
+        v[i * 2 + 1].color = c;
+        v[i * 2 + 1].x = cx + ca * r1; v[i * 2 + 1].y = y; v[i * 2 + 1].z = cz + sa * r1;
+    }
+    sceGuDrawArray(GU_TRIANGLE_STRIP, VT3, (n + 1) * 2, 0, v);
+}
+
 static void draw_stage(int frame) {
     g_flat = 0;
     g_flash = 0;
     bind_tex(-1);
 
-    /* horizon glow */
+    /* far backdrop: warm glow at the bottom fading to a dark ceiling */
     {
         Vtx *v = (Vtx *)sceGuGetMemory(6 * sizeof(Vtx));
         int k = 0;
-        uint32_t lo = 0xFF481C14, hi = 0xFF2A0C06;
-        qv(v, &k, -160, 0, -52, lo); qv(v, &k, 160, 0, -52, lo); qv(v, &k, 160, 16, -52, hi);
-        qv(v, &k, -160, 0, -52, lo); qv(v, &k, 160, 16, -52, hi); qv(v, &k, -160, 16, -52, hi);
+        uint32_t lo = 0xFF1C4CB8, hi = 0xFF080A22;
+        qv(v, &k, -90, 0, -34, lo); qv(v, &k, 90, 0, -34, lo); qv(v, &k, 90, 44, -34, hi);
+        qv(v, &k, -90, 0, -34, lo); qv(v, &k, 90, 44, -34, hi); qv(v, &k, -90, 44, -34, hi);
         sceGuDrawArray(GU_TRIANGLES, VT3, 6, 0, v);
     }
 
-    /* stars */
+    /* sandstone back wall */
     {
-        Vtx *v = (Vtx *)sceGuGetMemory(30 * 6 * sizeof(Vtx));
+        TVtx *v = (TVtx *)sceGuGetMemory(6 * sizeof(TVtx));
         int k = 0;
-        for (int i = 0; i < 30; i++) {
-            if ((frame / 8 + i) % 5 == 0) continue;
-            float x = -60.0f + (float)((i * 37) % 121);
-            float y = 14.0f + (float)((i * 53) % 30);
-            quadxy(v, &k, x, y, x + 0.5f, y + 0.5f, -55.0f, 0xFFFFFFFF);
-        }
-        if (k > 0) sceGuDrawArray(GU_TRIANGLES, VT3, k, 0, v);
+        uint32_t wc = 0xFFC8C8C8;
+        tvx(v, &k, -10.0f, 0.0f, wc, -60.0f, 0.0f,  -24.0f);
+        tvx(v, &k,  10.0f, 0.0f, wc,  60.0f, 0.0f,  -24.0f);
+        tvx(v, &k,  10.0f, 2.7f, wc,  60.0f, 16.0f, -24.0f);
+        tvx(v, &k, -10.0f, 0.0f, wc, -60.0f, 0.0f,  -24.0f);
+        tvx(v, &k,  10.0f, 2.7f, wc,  60.0f, 16.0f, -24.0f);
+        tvx(v, &k, -10.0f, 2.7f, wc, -60.0f, 16.0f, -24.0f);
+        bind_tex(T_BUILD);
+        sceGuDrawArray(GU_TRIANGLES, VTT, k, 0, v);
+        bind_tex(-1);
     }
 
-    /* moon (crescent) */
-    disc3(20.0f, 24.0f, -50.0f, 4.5f, 0xFFC0F8FF);
-    disc3(22.2f, 25.2f, -49.5f, 4.0f, 0xFF2A0C06);
+    /* glowing arched windows between the pillars */
+    {
+        Vtx *v = (Vtx *)sceGuGetMemory(14 * 12 * sizeof(Vtx));
+        int k = 0;
+        for (int i = -7; i <= 6; i++) {
+            float x = (float)i * 9.0f + 4.5f;
+            int fl = ((frame / 6) + i * 3) % 11 == 0;
+            uint32_t lo = fl ? 0xFF3090FF : 0xFF2078F0;
+            uint32_t hi = 0xFF1030A0;
+            /* dark frame */
+            quadxy(v, &k, x - 2.4f, 3.6f, x + 2.4f, 12.6f, -23.9f, 0xFF081030);
+            /* glow */
+            qv(v, &k, x - 2.0f, 4.0f, -23.8f, lo); qv(v, &k, x + 2.0f, 4.0f, -23.8f, lo); qv(v, &k, x + 2.0f, 12.0f, -23.8f, hi);
+            qv(v, &k, x - 2.0f, 4.0f, -23.8f, lo); qv(v, &k, x + 2.0f, 12.0f, -23.8f, hi); qv(v, &k, x - 2.0f, 12.0f, -23.8f, hi);
+        }
+        sceGuDrawArray(GU_TRIANGLES, VT3, k, 0, v);
+    }
 
-    /* textured ground */
+    /* gold cornice along the top of the wall */
+    box(0.0f, 16.4f, -23.0f, 130.0f, 1.2f, 2.4f, 0xFF30A8E0);
+    box(0.0f, 0.5f, -23.0f, 130.0f, 1.0f, 1.6f, 0xFF2078B0);
+
+    /* pillars */
+    for (int i = -6; i <= 6; i++) {
+        float x = (float)i * 9.0f;
+        box(x, 0.5f, -14.0f, 2.8f, 1.0f, 2.8f, 0xFF30A8E0);
+        pillar(x, -14.0f, 1.0f, 1.0f, 14.2f, 0xFF10188A);
+        pillar(x, -14.0f, 1.12f, 3.2f, 3.8f, 0xFF30A8E0);
+        pillar(x, -14.0f, 1.12f, 9.0f, 9.6f, 0xFF30A8E0);
+        box(x, 14.6f, -14.0f, 3.0f, 0.9f, 3.0f, 0xFF30A8E0);
+    }
+
+    /* hanging chandelier lights (little flicker) */
+    for (int i = -4; i <= 4; i++) {
+        float x = (float)i * 9.0f + 4.5f;
+        float fl = 0.5f * sinf((float)frame * 0.13f + (float)i * 1.7f);
+        disc3(x, 11.0f, -17.0f, 1.0f + 0.12f * fl, 0x50307CFF);
+        disc3(x, 11.0f, -17.1f, 0.45f, 0xFF80F0FF);
+    }
+
+    /* floor: polished marble */
     {
         TVtx *v = (TVtx *)sceGuGetMemory(16 * 6 * sizeof(TVtx));
         int k = 0;
         for (int i = 0; i < 16; i++) {
             float x0 = -48.0f + i * 6.0f, x1 = x0 + 6.0f;
             float z0 = -46.0f, z1 = 26.0f;
-            uint32_t c = (i & 1) ? 0xFFE0E0E0 : 0xFFFFFFFF;
+            uint32_t c = (i & 1) ? 0xFFD8D8D8 : 0xFFFFFFFF;
             float u0 = x0 / 3.0f, u1 = x1 / 3.0f, v0 = z0 / 3.0f, v1 = z1 / 3.0f;
             tvx(v, &k, u0, v0, c, x0, 0.0f, z0);
             tvx(v, &k, u1, v0, c, x1, 0.0f, z0);
@@ -1038,25 +1113,44 @@ static void draw_stage(int frame) {
         }
         bind_tex(T_GROUND);
         sceGuDrawArray(GU_TRIANGLES, VTT, k, 0, v);
+        bind_tex(-1);
     }
 
-    /* skyline */
-    for (int b = 0; b < 17; b++) {
-        float x = -48.0f + b * 6.0f;
-        float h = 6.0f + (float)((b * 37) % 11);
-        box(x, h * 0.5f, -26.0f, 5.0f, h, 4.0f, 0xFF140804);
-
-        TVtx *v = (TVtx *)sceGuGetMemory(6 * sizeof(TVtx));
+    /* the fighting ring: gold rings and spokes */
+    floor_ring(STAGE_CX, 0.0f, 0.0f, 14.2f, 0.04f, 0x70102060);
+    floor_ring(STAGE_CX, 0.0f, 14.2f, 15.2f, 0.06f, 0xFF30B8F0);
+    floor_ring(STAGE_CX, 0.0f, 11.4f, 11.8f, 0.06f, 0xFF2090D0);
+    floor_ring(STAGE_CX, 0.0f, 3.0f, 3.5f, 0.06f, 0xFF30B8F0);
+    {
+        Vtx *v = (Vtx *)sceGuGetMemory(8 * 6 * sizeof(Vtx));
         int k = 0;
-        float v0 = b * 0.37f, v1 = v0 + (h - 0.6f) / 9.0f;
-        tvx(v, &k, 0.0f, v1, 0xFFFFFFFF, x - 2.5f, 0.6f, -23.9f);
-        tvx(v, &k, 1.0f, v1, 0xFFFFFFFF, x + 2.5f, 0.6f, -23.9f);
-        tvx(v, &k, 1.0f, v0, 0xFFFFFFFF, x + 2.5f, h,    -23.9f);
-        tvx(v, &k, 0.0f, v1, 0xFFFFFFFF, x - 2.5f, 0.6f, -23.9f);
-        tvx(v, &k, 1.0f, v0, 0xFFFFFFFF, x + 2.5f, h,    -23.9f);
-        tvx(v, &k, 0.0f, v0, 0xFFFFFFFF, x - 2.5f, h,    -23.9f);
-        bind_tex(T_BUILD);
-        sceGuDrawArray(GU_TRIANGLES, VTT, k, 0, v);
+        for (int i = 0; i < 8; i++) {
+            float a = (float)i * 0.7853982f;
+            float ca = cosf(a), sa = sinf(a);
+            float r0 = 3.5f, r1 = 11.4f, hw = 0.14f;
+            float px0 = STAGE_CX + ca * r0, pz0 = sa * r0;
+            float px1 = STAGE_CX + ca * r1, pz1 = sa * r1;
+            float ox = -sa * hw, oz = ca * hw;
+            uint32_t c = 0xFF2090D0;
+            qv(v, &k, px0 - ox, 0.06f, pz0 - oz, c); qv(v, &k, px0 + ox, 0.06f, pz0 + oz, c); qv(v, &k, px1 + ox, 0.06f, pz1 + oz, c);
+            qv(v, &k, px0 - ox, 0.06f, pz0 - oz, c); qv(v, &k, px1 + ox, 0.06f, pz1 + oz, c); qv(v, &k, px1 - ox, 0.06f, pz1 - oz, c);
+        }
+        sceGuDrawArray(GU_TRIANGLES, VT3, k, 0, v);
+    }
+
+    /* soft light beams from the ceiling (behind the fighters) */
+    {
+        Vtx *v = (Vtx *)sceGuGetMemory(3 * 6 * sizeof(Vtx));
+        int k = 0;
+        for (int i = -1; i <= 1; i++) {
+            float x = (float)i * 12.0f + STAGE_CX;
+            float pulse = 0.5f + 0.5f * sinf((float)frame * 0.02f + (float)i * 2.0f);
+            uint32_t bot = ((uint32_t)(0x1C + (int)(pulse * 0x14)) << 24) | 0x0070D8FF;
+            uint32_t top = 0x0070D8FF;
+            qv(v, &k, x - 0.8f, 20.0f, -9.0f, top); qv(v, &k, x + 0.8f, 20.0f, -9.0f, top); qv(v, &k, x + 4.0f, 0.0f, -9.0f, bot);
+            qv(v, &k, x - 0.8f, 20.0f, -9.0f, top); qv(v, &k, x + 4.0f, 0.0f, -9.0f, bot); qv(v, &k, x - 4.0f, 0.0f, -9.0f, bot);
+        }
+        sceGuDrawArray(GU_TRIANGLES, VT3, k, 0, v);
     }
     bind_tex(-1);
 }
@@ -1068,18 +1162,29 @@ static void draw_stage(int frame) {
    ===================================================================== */
 #define MODEL_MAX        3          /* model0 = Brawler, model1 = Speedster, model2 = Heavy */
 #define MTEX             256        /* model textures are shrunk to 256x256 */
-#define MAX_TRIS         3000       /* triangle limit per model */
-#define MODEL_HEIGHT     4.0f       /* models are scaled to this height (fighters are ~4) */
+#define MAX_TRIS         4500       /* triangle limit per model */
+#define CAM_BASE         6.9f       /* fight camera distance when the fighters are close (smaller = closer) */
+#define MODEL_HEIGHT     4.6f       /* models are scaled to this height (bigger = bigger fighters) */
 #define MODEL_FRONT_YAW  1.5707963f /* turns a Blender-default model to face the side.
                                        If your fighter faces the wrong way, try -1.5707963f */
-#define MODEL_TURN       0.45f      /* 3/4 view toward the camera */
+#define MODEL_TURN       0.28f      /* how far fighters turn toward the camera */
+#define NPART            6
+enum { P_HEAD = 0, P_TORSO, P_ARML, P_ARMR, P_LEGL, P_LEGR };
 
 typedef struct {
     int ntri;
     float *pos;   /* 3 floats per vertex */
     float *nrm;   /* 3 floats per vertex */
     float *uv;    /* 2 floats per vertex */
+    unsigned char *part;      /* which body part each triangle belongs to */
+    int split;                /* 1 = the OBJ has named parts (head, torso, arm_l ...) */
+    float piv[NPART][2];      /* joint position of each part: x (forward), y (up) */
 } Model;
+
+/* swing angle (radians) of every body part around its joint, plus body lean */
+typedef struct {
+    float a[NPART];
+} Pose;
 
 static Model models[MODEL_MAX];
 static int nmodels = 0;
@@ -1109,6 +1214,17 @@ static char *read_try(const char *name, long *outn) {
         fclose(f);
     }
     return b;
+}
+
+/* case-insensitive "starts with" for part names */
+static int name_is(const char *p, const char *want) {
+    while (*want) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        if (c != *want) return 0;
+        p++; want++;
+    }
+    return 1;
 }
 
 /* parses one face corner: "v", "v/t", "v//n" or "v/t/n" */
@@ -1158,8 +1274,9 @@ static int obj_load(int id, const char *name) {
     float *op = (float *)malloc((size_t)MAX_TRIS * 9 * sizeof(float));
     float *on = (float *)malloc((size_t)MAX_TRIS * 9 * sizeof(float));
     float *ou = (float *)malloc((size_t)MAX_TRIS * 6 * sizeof(float));
-    int iv = 0, it = 0, in = 0, tris = 0;
-    if (!fv || !ft || !fn || !op || !on || !ou) goto done;
+    unsigned char *pa = (unsigned char *)malloc((size_t)MAX_TRIS);
+    int iv = 0, it = 0, in = 0, tris = 0, cp = P_TORSO, isplit = 0;
+    if (!fv || !ft || !fn || !op || !on || !ou || !pa) goto done;
 
     for (char *p = buf; *p; ) {
         if (p[0] == 'v' && p[1] == ' ') {
@@ -1174,6 +1291,16 @@ static int obj_load(int id, const char *name) {
             char *e = p + 3;
             for (int k = 0; k < 3; k++) fn[in * 3 + k] = (float)strtod(e, &e);
             in++;
+        } else if (p[0] == 'o' && p[1] == ' ') {
+            const char *nm = p + 2;
+            while (*nm == ' ') nm++;
+            if      (name_is(nm, "head"))  { cp = P_HEAD;  isplit = 1; }
+            else if (name_is(nm, "torso")) { cp = P_TORSO; isplit = 1; }
+            else if (name_is(nm, "arm_l")) { cp = P_ARML;  isplit = 1; }
+            else if (name_is(nm, "arm_r")) { cp = P_ARMR;  isplit = 1; }
+            else if (name_is(nm, "leg_l")) { cp = P_LEGL;  isplit = 1; }
+            else if (name_is(nm, "leg_r")) { cp = P_LEGR;  isplit = 1; }
+            else                           { cp = P_TORSO; }
         } else if (p[0] == 'f' && (p[1] == ' ' || p[1] == '\t')) {
             int vi[16], ti[16], ni[16], nc = 0;
             const char *s = p + 1;
@@ -1218,6 +1345,7 @@ static int obj_load(int id, const char *name) {
                     on[o * 3] = nn[j][0]; on[o * 3 + 1] = nn[j][1]; on[o * 3 + 2] = nn[j][2];
                     ou[o * 2] = uu[j][0]; ou[o * 2 + 1] = uu[j][1];
                 }
+                pa[tris] = (unsigned char)cp;
                 tris++;
             }
         }
@@ -1259,17 +1387,52 @@ static int obj_load(int id, const char *name) {
             on[i * 3 + 2] = -nx * sf + nz * cf;
         }
     }
+    /* joints: head = bottom of the head, arms/legs = top of the limb */
+    for (int pi = 0; pi < NPART; pi++) {
+        float mn = 1e30f, mx = -1e30f;
+        int cnt = 0;
+        for (int t = 0; t < tris; t++) {
+            if (pa[t] != pi) continue;
+            for (int j = 0; j < 3; j++) {
+                float y = op[(t * 3 + j) * 3 + 1];
+                if (y < mn) mn = y;
+                if (y > mx) mx = y;
+                cnt++;
+            }
+        }
+        models[id].piv[pi][0] = 0.0f;
+        models[id].piv[pi][1] = MODEL_HEIGHT * 0.5f;
+        if (cnt == 0 || pi == P_TORSO) continue;
+        float band = (mx - mn) * 0.12f;
+        float sx = 0.0f, sy2 = 0.0f;
+        int n2 = 0;
+        for (int t = 0; t < tris; t++) {
+            if (pa[t] != pi) continue;
+            for (int j = 0; j < 3; j++) {
+                float x = op[(t * 3 + j) * 3];
+                float y = op[(t * 3 + j) * 3 + 1];
+                int inband = (pi == P_HEAD) ? (y <= mn + band) : (y >= mx - band);
+                if (inband) { sx += x; sy2 += y; n2++; }
+            }
+        }
+        if (n2 > 0) {
+            models[id].piv[pi][0] = sx / (float)n2;
+            models[id].piv[pi][1] = sy2 / (float)n2;
+        }
+    }
     models[id].ntri = tris;
     models[id].pos = op;
     models[id].nrm = on;
     models[id].uv = ou;
-    op = NULL; on = NULL; ou = NULL;   /* the model now owns these */
+    models[id].part = pa;
+    models[id].split = isplit;
+    op = NULL; on = NULL; ou = NULL; pa = NULL;   /* the model now owns these */
     ok = 1;
 
 done:
     free(buf);
     free(fv); free(ft); free(fn);
-    free(op); free(on); free(ou);
+    free(op); free(on); free(ou); free(pa);
     return ok;
 }
 
@@ -1356,19 +1519,39 @@ static void bind_mtex(int i) {
 }
 
 /* draws a model at world position (wx, wy, wz) = its feet.
-   lean turns it about the hips (+ = forward), yaw about the up axis, sy squashes it. */
+   lean turns it about the hips (+ = forward), yaw about the up axis, sy squashes it.
+   pose (or NULL) swings the head, arms and legs around their joints. */
 static void model_draw(int id, float wx, float wy, float wz, float yaw, float lean,
-                       float sy, uint32_t tint, int flash) {
+                       float sy, uint32_t tint, int flash, const Pose *pose) {
     Model *m = &models[id];
     int nv = m->ntri * 3;
     TVtx *v = (TVtx *)sceGuGetMemory((unsigned int)nv * sizeof(TVtx));
     float cl = cosf(lean), sl = sinf(lean);
     float cyw = cosf(yaw), syw = sinf(yaw);
-    const float piv = 2.0f;
+    const float piv = MODEL_HEIGHT * 0.5f;
+    float pc[NPART], ps[NPART];
+    for (int k = 0; k < NPART; k++) {
+        float an = (pose && m->split) ? pose->a[k] : 0.0f;
+        pc[k] = cosf(an); ps[k] = sinf(an);
+    }
 
     for (int i = 0; i < nv; i++) {
-        float x = m->pos[i * 3], y = m->pos[i * 3 + 1] * sy, z = m->pos[i * 3 + 2];
+        float x = m->pos[i * 3], y = m->pos[i * 3 + 1], z = m->pos[i * 3 + 2];
         float nx = m->nrm[i * 3], ny = m->nrm[i * 3 + 1], nz = m->nrm[i * 3 + 2];
+
+        /* swing the body part around its joint (forward = +x) */
+        if (pose && m->split) {
+            int k = m->part[i / 3];
+            if (k != P_TORSO) {
+                float dx = x - m->piv[k][0], dy = y - m->piv[k][1];
+                x = m->piv[k][0] + dx * pc[k] - dy * ps[k];
+                y = m->piv[k][1] + dx * ps[k] + dy * pc[k];
+                float tx = nx * pc[k] - ny * ps[k];
+                ny = nx * ps[k] + ny * pc[k];
+                nx = tx;
+            }
+        }
+        y *= sy;
 
         float yy = y - piv;                         /* lean about the hips */
         float x1 = x * cl + yy * sl;
@@ -1393,31 +1576,112 @@ static void model_draw(int id, float wx, float wy, float wz, float yaw, float le
     sceGuDrawArray(GU_TRIANGLES, VTT, nv, 0, v);
 }
 
+/* progress (0..1) of the attack being drawn; main() sets it before drawing a fighter */
+static float g_prog = 0.0f;
+
+/* 0 at rest, 1 when the blow lands (th = point of impact, 0..0.5) */
+static float strike(float t, float th) {
+    float a = th * 0.55f;
+    if (t < a) return -0.35f * (t / a);
+    if (t < th) return -0.35f + 1.35f * ((t - a) / (th - a));
+    if (t < th + 0.12f) return 1.0f;
+    float r = (t - th - 0.12f) / (1.0f - th - 0.12f);
+    return (r >= 1.0f) ? 0.0f : 1.0f - r;
+}
+
 /* returns 1 if a model was drawn (so the procedural body is skipped) */
 static int draw_model_fighter(int x, int y, int face, int flash, int atk, int block,
                               int walk, int frame, int style, float z) {
     if (style < 0 || style >= MODEL_MAX || models[style].ntri == 0) return 0;
     int air = (y < GROUND - 80);
     float lean = 0.0f, sy = 1.0f, shift = 0.0f, bob = 0.0f;
+    Pose ps;
+    float t = (float)frame;
+    /* the arm/leg nearest the camera is the character's right one when facing right */
+    int near_arm = (face > 0) ? P_ARMR : P_ARML;
+    int far_arm  = (face > 0) ? P_ARML : P_ARMR;
+    int near_leg = (face > 0) ? P_LEGR : P_LEGL;
+    int far_leg  = (face > 0) ? P_LEGL : P_LEGR;
 
-    if (atk == 1)      { lean = 0.22f;  shift = 0.35f; }   /* light punch: lean in */
-    else if (atk == 2) { lean = 0.38f;  shift = 0.70f; }   /* heavy punch: big lunge */
-    else if (atk == 3) { lean = -0.18f; shift = 0.30f; }   /* light kick: lean back */
-    else if (atk == 4) { lean = -0.32f; shift = 0.50f; }   /* heavy kick: lean way back */
-    else if (block)    { lean = -0.10f; sy = 0.93f; }      /* guard: sink a little */
-    else if (walk)     { lean = 0.07f;  bob = fabsf(sinf(frame * 0.35f)) * 0.12f; }
-    if (air && atk == 0) { lean = 0.05f; sy = 1.04f; }     /* stretch in the air */
+    /* fighting stance: arms up a little, legs apart, gentle breathing */
+    float br = sinf(t * 0.09f);
+    ps.a[P_HEAD]  = 0.0f;
+    ps.a[P_TORSO] = 0.0f;
+    ps.a[near_arm] = 0.45f + 0.05f * br;
+    ps.a[far_arm]  = 0.55f - 0.05f * br;
+    ps.a[near_leg] = 0.16f;
+    ps.a[far_leg]  = -0.16f;
+    bob = 0.03f * br;
+
+    if (atk > 0) {
+        float p = g_prog;
+        float se, s;
+        if (atk == 1) {            /* light punch: quick jab with the near arm */
+            s = strike(p, 0.30f); se = s > 0.0f ? s : 0.0f;
+            ps.a[near_arm] = 0.45f + s * 1.05f;
+            ps.a[far_arm]  = 0.85f;
+            lean = 0.16f * se; shift = 0.30f * se;
+        } else if (atk == 2) {     /* heavy punch: big swing with the far arm */
+            s = strike(p, 0.40f); se = s > 0.0f ? s : 0.0f;
+            ps.a[far_arm]  = 0.55f + s * 1.05f;
+            ps.a[near_arm] = 0.60f - 0.5f * se;
+            ps.a[P_HEAD]   = -0.10f * se;
+            lean = 0.34f * se; shift = 0.65f * se;
+        } else if (atk == 3) {     /* light kick: near leg snaps up */
+            s = strike(p, 0.36f); se = s > 0.0f ? s : 0.0f;
+            ps.a[near_leg] = 0.16f + s * 1.15f;
+            ps.a[far_leg]  = -0.10f;
+            ps.a[near_arm] = 0.2f; ps.a[far_arm] = 0.5f;
+            lean = -0.16f * se; shift = 0.25f * se;
+        } else {                   /* heavy kick: high far-leg kick */
+            s = strike(p, 0.46f); se = s > 0.0f ? s : 0.0f;
+            ps.a[far_leg]  = -0.16f + s * 1.75f;
+            ps.a[near_leg] = 0.10f;
+            ps.a[near_arm] = 0.1f; ps.a[far_arm] = 0.7f;
+            lean = -0.30f * se; shift = 0.45f * se;
+        }
+    } else if (block) {            /* guard: both arms up in front of the face */
+        ps.a[near_arm] = 1.15f;
+        ps.a[far_arm]  = 1.30f;
+        ps.a[P_HEAD]   = -0.08f;
+        ps.a[near_leg] = 0.28f; ps.a[far_leg] = -0.22f;
+        lean = -0.08f; sy = 0.94f;
+    } else if (air) {              /* jump: knees up, arms up */
+        ps.a[near_leg] = 0.65f; ps.a[far_leg] = -0.25f;
+        ps.a[near_arm] = 0.9f;  ps.a[far_arm] = 0.7f;
+        lean = 0.05f; sy = 1.03f;
+    } else if (walk) {             /* walking: legs and arms swing opposite */
+        float g = sinf(t * 0.30f);
+        ps.a[near_leg] = 0.55f * g;
+        ps.a[far_leg]  = -0.55f * g;
+        ps.a[near_arm] = 0.35f - 0.40f * g;
+        ps.a[far_arm]  = 0.35f + 0.40f * g;
+        lean = 0.06f;
+        bob = fabsf(g) * 0.10f;
+    }
+
+    if (flash) {                   /* getting hit: snap back */
+        lean = -0.24f;
+        ps.a[P_HEAD] = 0.35f;
+        ps.a[near_arm] = -0.5f; ps.a[far_arm] = -0.3f;
+        ps.a[near_leg] = 0.1f;  ps.a[far_leg] = -0.1f;
+    }
+
+    /* feet stay planted: cancel the body lean on the legs that are standing */
+    if (atk == 3)      ps.a[far_leg] += lean;
+    else if (atk == 4) ps.a[near_leg] += lean;
+    else { ps.a[near_leg] += lean; ps.a[far_leg] += lean; }
 
     V3 p = wp((float)x + 20.0f, (float)(y + 80), z);        /* feet position */
     float yaw = (face < 0 ? 3.1415927f : 0.0f) - MODEL_TURN * (float)face;
-    model_draw(style, p.x + shift * (float)face, p.y + bob, p.z, yaw, lean, sy, 0xFFFFFFFF, flash);
+    model_draw(style, p.x + shift * (float)face, p.y + bob, p.z, yaw, lean, sy, 0xFFFFFFFF, flash, &ps);
     return 1;
 }
 
 static int draw_model_fallen(int x, int style) {
     if (style < 0 || style >= MODEL_MAX || models[style].ntri == 0) return 0;
     V3 p = wp((float)x + 43.0f, (float)GROUND, 0.0f);
-    model_draw(style, p.x, p.y - 1.5f, p.z, 0.0f, -1.5707963f, 1.0f, 0xFFFFFFFF, 0);
+    model_draw(style, p.x, p.y - (MODEL_HEIGHT * 0.5f - 0.6f), p.z, 0.0f, -1.5707963f, 1.0f, 0xFFFFFFFF, 0, NULL);
     return 1;
 }
 
@@ -1695,7 +1959,7 @@ int main(int argc, char **argv) {
                 state = 1;
             }
 
-            set_camera(v3(sinf(frame * 0.012f) * 2.0f, 3.2f, 17.0f), v3(0.0f, 2.2f, 0.0f));
+            set_camera(v3(sinf(frame * 0.012f) * 1.5f, 3.0f, 13.0f), v3(0.0f, 2.3f, 0.0f));
             draw_stage(frame);
             for (int i = 0; i < 3; i++) {
                 float wx = (cfx[i] + 20 - 240) / 20.0f;
@@ -2034,18 +2298,21 @@ int main(int argc, char **argv) {
                 float midpx = ((px + 20) + (ex + 20)) * 0.5f;
                 float midx = (midpx - 240.0f) / 20.0f;
                 float sep = (float)((px > ex) ? (px - ex) : (ex - px)) / 20.0f;
-                float dist = 11.0f + sep * 0.3f;
-                float camx = midx * 0.6f;
+                float dist = CAM_BASE + sep * 0.5f;      /* close up, pulls back when far apart */
+                float camx = midx * 0.85f;
+                float jmp = (float)(GROUND - 80 - py) / 20.0f;
+                if (jmp < 0.0f) jmp = 0.0f;
+                float camy = 2.45f + jmp * 0.30f;
                 float shx = 0.0f, shy = 0.0f;
                 /* camera punches in during a hit-stop freeze */
                 if (hitstop > 0 && hitmax > 0)
-                    dist -= ((hitmax > 6) ? 1.5f : 0.7f) * (float)hitstop / (float)hitmax;
+                    dist -= ((hitmax > 6) ? 1.0f : 0.5f) * (float)hitstop / (float)hitmax;
                 if (shake > 0) {
                     shx = ((frame & 1) ? 1.0f : -1.0f) * shake * 0.04f;
                     shy = ((frame & 2) ? 1.0f : -1.0f) * shake * 0.03f;
                     if (!paused && !frozen) shake--;   /* shake holds still while frozen */
                 }
-                set_camera(v3(camx + shx, 3.6f + shy, dist), v3(camx, 2.4f, 0.0f));
+                set_camera(v3(camx + shx, camy + 0.15f + shy, dist), v3(camx, camy - 0.15f, 0.0f));
             }
             draw_stage(frame);
 
@@ -2070,6 +2337,7 @@ int main(int argc, char **argv) {
                     draw_fighter(px + pface * 35, py, pface, 0, ((psp / 3) % 2) ? 1 : 0,
                                  0, 0, frame, 3, -0.9f);
                 }
+                g_prog = (patk > 0 && mdur[patk] > 0) ? 1.0f - (float)pt / (float)mdur[patk] : 0.0f;
                 draw_fighter(dpx, py, pface, pflash > 0, patk, pblock, pwalk, frame, pc, 0.0f);
                 if (pblock) draw_shield((pface == 1) ? dpx + 44.0f : dpx - 4.0f, py + 40.0f);
             }
@@ -2087,6 +2355,7 @@ int main(int argc, char **argv) {
                     draw_fighter(ex + eface * 35, GROUND - 80, eface, 0, ((esp / 3) % 2) ? 1 : 0,
                                  0, 0, frame, 3, -0.9f);
                 }
+                g_prog = (eatk > 0 && mdur[eatk] > 0) ? 1.0f - (float)et / (float)mdur[eatk] : 0.0f;
                 draw_fighter(dex, GROUND - 80, eface, eflash > 0, eatk, eblock > 0, ewalk, frame, ec, 0.0f);
                 if (eblock > 0) draw_shield((eface == 1) ? dex + 44.0f : dex - 4.0f, GROUND - 40.0f);
             }
@@ -2160,81 +2429,4 @@ int main(int argc, char **argv) {
                     /* O */
                     disc(268, 122, 25, 0xFF0030FF);
                     disc(268, 122, 14, 0xFF000000);
-                    rect(306, 140, 8, 8, 0xFF0030FF);
-                }
-                if (pwon) textx(240, 21, 0xFF30FF30, "YOU WIN");
-                else      textx(240, 21, 0xFF3030FF, "YOU LOSE");
-            }
-
-            /* ---- pause overlay ---- */
-            if (paused == 1) {
-                const char *opt[4];
-                opt[0] = "RESUME";
-                opt[1] = training ? "RESET POSITIONS" : "RESTART MATCH";
-                opt[2] = "MOVE LIST";
-                opt[3] = "QUIT TO TITLE";
-                rect(0, 0, W, H, 0x99000000);
-                rect(130, 46, 220, 160, 0xFF000000);
-                rect(130, 46, 220, 2, 0xFF00E0FF);
-                rect(130, 204, 220, 2, 0xFF00E0FF);
-                rect(130, 46, 2, 160, 0xFF00E0FF);
-                rect(348, 46, 2, 160, 0xFF00E0FF);
-                textx(240, 8, 0xFF00E0FF, "PAUSED");
-                for (int i = 0; i < 4; i++) {
-                    if (i == pcur) sprintf(buf, "> %s <", opt[i]);
-                    else           sprintf(buf, "%s", opt[i]);
-                    textx(240, 11 + i * 2, (i == pcur) ? 0xFF00E0FF : 0xFFFFFFFF, buf);
-                }
-                textx(240, 21, 0xFFB0B0B0, "UP/DOWN + X");
-            } else if (paused == 2) {
-                rect(0, 0, W, H, 0x99000000);
-                rect(110, 30, 260, 200, 0xFF000000);
-                rect(110, 30, 260, 2, 0xFF00E0FF);
-                rect(110, 228, 260, 2, 0xFF00E0FF);
-                rect(110, 30, 2, 200, 0xFF00E0FF);
-                rect(368, 30, 2, 200, 0xFF00E0FF);
-                textx(240, 5, 0xFF00E0FF, "MOVE LIST");
-                textl(18, 8,  0xFFFFFFFF, "SQUARE    LIGHT PUNCH");
-                textl(18, 10, 0xFFFFFFFF, "TRIANGLE  HEAVY PUNCH");
-                textl(18, 12, 0xFFFFFFFF, "X         LIGHT KICK");
-                textl(18, 14, 0xFFFFFFFF, "CIRCLE    HEAVY KICK");
-                textl(18, 16, 0xFFFFFFFF, "UP        JUMP");
-                textl(18, 18, 0xFFFFFFFF, "L (HOLD)  BLOCK");
-                textl(18, 20, 0xFFFFFFFF, "R         STAND RUSH");
-                textx(240, 22, 0xFFB0B0B0, "(NEEDS A FULL METER)");
-                textx(240, 24, 0xFF30D0FF, "HEAVY HITS HARDER BUT SLOWER");
-                textx(240, 26, 0xFF30FF30, "PRESS X TO GO BACK");
-            }
-        }
-
-        /* ================= MATCH OVER ================= */
-        else {
-            mt++;
-            if (mt > 40 && (pressed & (PSP_CTRL_CROSS | PSP_CTRL_START))) {
-                state = 0;
-            }
-
-            set_camera(v3(sinf(frame * 0.01f) * 3.0f, 3.4f, 13.0f), v3(0.0f, 2.2f, 0.0f));
-            draw_stage(frame);
-            if (matchwon) {
-                shadow(0.0f, 0.0f);
-                draw_fighter(220, GROUND - 80, 1, 0, 0, 0, 0, frame, pc, 0.0f);
-            } else {
-                draw_fallen(210, pc);
-            }
-
-            sceGuDisable(GU_DEPTH_TEST);
-            rect(0, 40, W, 60, 0xFF000000);
-            if (matchwon) textx(240, 6, 0xFF30FF30, "YOU WIN THE MATCH!");
-            else          textx(240, 6, 0xFF3030FF, "YOU LOST THE MATCH");
-            buf[0] = '0' + pwins; buf[1] = ' '; buf[2] = '-'; buf[3] = ' ';
-            buf[4] = '0' + ewins; buf[5] = 0;
-            textx(240, 9, 0xFF00E0FF, buf);
-            if (mt > 40 && (frame / 30) % 2 == 0)
-                textx(240, 27, 0xFF30FF30, "PRESS X FOR TITLE SCREEN");
-        }
-
-        end_frame();
-    }
-    return 0;
-}
+                    rect(306, 14
