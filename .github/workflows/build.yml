@@ -1,0 +1,19 @@
+name: Build PSP EBOOT
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: pspdev/pspdev:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Upload EBOOT
+        uses: actions/upload-artifact@v4
+        with:
+          name: JojoFighter-EBOOT
+          path: EBOOT.PBP
