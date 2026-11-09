@@ -1,0 +1,43 @@
+name: Build PSP EBOOT
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: pspdev/pspdev:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make
+
+      - name: Prepare PSP package
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist
+          test -f EBOOT.PBP
+          cp EBOOT.PBP dist/
+
+          # The game loads these assets from the same folder as EBOOT.PBP.
+          # Copy whichever optional model/texture files are present in the repo.
+          for pattern in 'model*.obj' 'model*.png' 'head*.png' 'body*.png' 'legs*.png' 'ground.png' 'building.png' 'stand.png'; do
+            for file in $pattern; do
+              if [ -f "$file" ]; then
+                cp "$file" dist/
+              fi
+            done
+          done
+
+          echo 'Files included in PSP package:'
+          ls -lah dist
+
+      - name: Upload PSP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: JojoFighter-PSP
+          path: dist/
+          if-no-files-found: error
