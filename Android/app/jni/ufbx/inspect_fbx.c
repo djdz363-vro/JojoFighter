@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include "ufbx.h"
 
@@ -19,6 +20,23 @@ static void inspect_file(const char *path)
     printf("Skin deformers: %zu\n", scene->skin_deformers.count);
     printf("Animation stacks: %zu\n", scene->anim_stacks.count);
 
+    for (size_t i = 0; i < scene->nodes.count; i++) {
+        ufbx_node *node = scene->nodes.data[i];
+
+        if (node->bone) {
+            printf("Bone: %.*s | Parent: ",
+                (int)node->name.length, node->name.data);
+
+            if (node->parent) {
+                printf("%.*s\n",
+                    (int)node->parent->name.length,
+                    node->parent->name.data);
+            } else {
+                printf("(none)\n");
+            }
+        }
+    }
+
     for (size_t i = 0; i < scene->meshes.count; i++) {
         ufbx_mesh *mesh = scene->meshes.data[i];
 
@@ -33,6 +51,7 @@ static void inspect_file(const char *path)
 
         for (size_t j = 0; j < mesh->skin_deformers.count; j++) {
             ufbx_skin_deformer *skin = mesh->skin_deformers.data[j];
+
             printf("  Skin %zu: %zu clusters, max %zu weights/vertex\n",
                 j, skin->clusters.count, skin->max_weights_per_vertex);
         }
@@ -56,5 +75,6 @@ int main(void)
 {
     inspect_file("Android/app/src/main/assets/model0.fbx");
     inspect_file("Android/app/src/main/assets/Mma Idle.fbx");
+
     return 0;
 }
