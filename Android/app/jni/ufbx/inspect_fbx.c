@@ -2,70 +2,58 @@
 #include <stdio.h>
 #include "ufbx.h"
 
-static void inspect_file(const char *path)
+static void inspect_animation(const char *path)
 {
     ufbx_error error;
     ufbx_scene *scene = ufbx_load_file(path, NULL, &error);
 
-    printf("\n========== %s ==========\n", path);
+    printf("\n========== ANIMATION TEST: %s ==========\n", path);
 
     if (!scene) {
         printf("FAILED TO LOAD FILE\n");
         return;
     }
 
-    printf("Nodes: %zu\n", scene->nodes.count);
-    printf("Meshes: %zu\n", scene->meshes.count);
-    printf("Bones: %zu\n", scene->bones.count);
-    printf("Skin deformers: %zu\n", scene->skin_deformers.count);
-    printf("Animation stacks: %zu\n", scene->anim_stacks.count);
-
-    for (size_t i = 0; i < scene->nodes.count; i++) {
-        ufbx_node *node = scene->nodes.data[i];
-
-        if (node->bone) {
-            printf("Bone: %.*s | Parent: ",
-                (int)node->name.length, node->name.data);
-
-            if (node->parent) {
-                printf("%.*s\n",
-                    (int)node->parent->name.length,
-                    node->parent->name.data);
-            } else {
-                printf("(none)\n");
-            }
-        }
+    if (scene->anim_stacks.count == 0 || scene->meshes.count == 0) {
+        printf("Missing animation or mesh\n");
+        ufbx_free_scene(scene);
+        return;
     }
 
-    for (size_t i = 0; i < scene->meshes.count; i++) {
-        ufbx_mesh *mesh = scene->meshes.data[i];
+    ufbx_anim_stack *stack = scene->anim_stacks.data[0];
 
-        printf("\nMesh %zu:\n", i);
-        printf("  Vertices: %zu\n", mesh->num_vertices);
-        printf("  Triangles: %zu\n", mesh->num_triangles);
-        printf("  UV available: %s\n",
-            mesh->vertex_uv.exists ? "yes" : "no");
-        printf("  Normals available: %s\n",
-            mesh->vertex_normal.exists ? "yes" : "no");
-        printf("  Skin deformers: %zu\n", mesh->skin_deformers.count);
+    printf("Animation duration: %.3f seconds\n",
+        stack->time_end - stack->time_begin);
 
-        for (size_t j = 0; j < mesh->skin_deformers.count; j++) {
-            ufbx_skin_deformer *skin = mesh->skin_deformers.data[j];
+    ufbx_evaluate_opts opts = {0};
+    opts.evaluate_skinning = true;
 
-            printf("  Skin %zu: %zu clusters, max %zu weights/vertex\n",
-                j, skin->clusters.count, skin->max_weights_per_vertex);
+    double times[] = {0.0, 2.5, 4.9};
+
+    for (size_t i = 0; i < 3; i++) {
+        ufbx_scene *evaluated = ufbx_evaluate_scene(
+            scene, stack->anim, times[i], &opts, &error);
+
+        if (!evaluated) {
+            printf("Evaluation failed at %.2f seconds\n", times[i]);
+            continue;
         }
-    }
 
-    for (size_t i = 0; i < scene->anim_stacks.count; i++) {
-        ufbx_anim_stack *anim = scene->anim_stacks.data[i];
+        ufbx_mesh *mesh = evaluated->meshes.data[0];
 
-        printf("\nAnimation %zu: %.*s\n",
-            i, (int)anim->name.length, anim->name.data);
-        printf("  Start: %.3f seconds\n", anim->time_begin);
-        printf("  End: %.3f seconds\n", anim->time_end);
-        printf("  Duration: %.3f seconds\n",
-            anim->time_end - anim->time_begin);
+        printf("\nTime: %.2f seconds\n", times[i]);
+        printf("Skinned positions available: %s\n",
+            mesh->skinned_position.exists ? "yes" : "no");
+
+        if (mesh->skinned_position.exists) {
+            ufbx_vec3 p = ufbx_get_vertex_vec3(
+                &mesh->skinned_position, 0);
+
+            printf("Vertex 0: X=%.5f Y=%.5f Z=%.5f\n",
+                p.x, p.y, p.z);
+        }
+
+        ufbx_free_scene(evaluated);
     }
 
     ufbx_free_scene(scene);
@@ -73,8 +61,6 @@ static void inspect_file(const char *path)
 
 int main(void)
 {
-    inspect_file("Android/app/src/main/assets/model0.fbx");
-    inspect_file("Android/app/src/main/assets/Mma Idle.fbx");
-
+    inspect_animation("Android/app/src/main/assets/Mma Idle.fbx");
     return 0;
 }
