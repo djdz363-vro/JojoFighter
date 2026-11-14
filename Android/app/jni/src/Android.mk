@@ -6,10 +6,13 @@ LOCAL_MODULE := main
 
 SDL_PATH := ../SDL
 
-LOCAL_C_INCLUDES := $(LOCAL_PATH)/$(SDL_PATH)/include
+LOCAL_C_INCLUDES := \
+    $(LOCAL_PATH)/$(SDL_PATH)/include \
+    $(LOCAL_PATH)/../ufbx
 
-# Add your application source files here...
-LOCAL_SRC_FILES := main.c
+LOCAL_SRC_FILES := \
+    main.c \
+    ../ufbx/ufbx.c
 
 LOCAL_SHARED_LIBRARIES := SDL2
 
