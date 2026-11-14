@@ -1,0 +1,23 @@
+name: Inspect FBX Models
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile FBX Inspector
+        run: |
+          gcc -std=c99 -O2 \
+            -I Android/app/jni/ufbx \
+            Android/app/jni/ufbx/inspect_fbx.c \
+            Android/app/jni/ufbx/ufbx.c \
+            -lm -o inspect_fbx
+
+      - name: Inspect Models
+        run: ./inspect_fbx
