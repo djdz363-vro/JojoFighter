@@ -12,6 +12,7 @@ LOCAL_C_INCLUDES := \
 
 LOCAL_SRC_FILES := \
     main.c \
+    fbx_loader.c \
     ../ufbx/ufbx.c
 
 LOCAL_SHARED_LIBRARIES := SDL2
