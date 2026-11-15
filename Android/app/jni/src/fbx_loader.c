@@ -14,7 +14,22 @@ int fbx_load(FBXModel *model, const char *path)
     ufbx_load_opts options = {0};
     options.generate_missing_normals = true;
 
-    model->scene = ufbx_load_file(path, &options, &error);
+    size_t data_size = 0;
+void *data = SDL_LoadFile(path, &data_size);
+
+if (!data) {
+    SDL_Log("FBX file read failed: %s", SDL_GetError());
+    return 0;
+}
+
+model->scene = ufbx_load_memory(
+    data,
+    data_size,
+    &options,
+    &error
+);
+
+SDL_free(data);
 
     if (!model->scene) {
         char message[512];
