@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include "fbx_loader.h"
 
 typedef struct { float p[3], uv[2], n[3]; } Vertex;
 typedef struct { Vertex *v; size_t count, cap; } Mesh;
@@ -95,23 +96,93 @@ int main(int argc,char **argv){
  SDL_Window *win=SDL_CreateWindow("JoJo Fighter - OBJ Test",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,800,450,SDL_WINDOW_OPENGL|SDL_WINDOW_SHOWN|SDL_WINDOW_RESIZABLE);
  if(!win){SDL_Log("Window: %s",SDL_GetError());SDL_Quit();return 1;}SDL_GLContext ctx=SDL_GL_CreateContext(win);if(!ctx){SDL_Log("Context: %s",SDL_GetError());SDL_DestroyWindow(win);SDL_Quit();return 1;}SDL_GL_SetSwapInterval(1);
  GLuint prog=programCreate();if(!prog){SDL_GL_DeleteContext(ctx);SDL_DestroyWindow(win);SDL_Quit();return 1;}
- Mesh mesh={0};int ok=loadOBJ("model0.obj",&mesh);GLuint tex=loadBMP("model0.bmp");
- GLuint meshVBO=0,fpsVBO=0;glGenBuffers(1,&meshVBO);glGenBuffers(1,&fpsVBO);if(ok){glBindBuffer(GL_ARRAY_BUFFER,meshVBO);glBufferData(GL_ARRAY_BUFFER,mesh.count*sizeof(Vertex),mesh.v,GL_STATIC_DRAW);}
+FBXModel fbx = {0};
+FBXMesh frameMesh = {0};
+int fbxOK = fbx_load(&fbx, "Mma Idle.fbx");
+if (fbxOK) fbxOK = fbx_build_mesh(&fbx, 0.0, &frameMesh);
+GLuint tex = loadBMP("model0.bmp");
+GLuint meshVBO = 0, fpsVBO = 0;
+glGenBuffers(1, &meshVBO);
+glGenBuffers(1, &fpsVBO);
+
+if (fbxOK && frameMesh.vertex_count > 0) {
+    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        frameMesh.vertex_count * sizeof(FBXVertex),
+        frameMesh.vertices,
+        GL_DYNAMIC_DRAW
+    );
+}
  GLint pos=glGetAttribLocation(prog,"aPosition"),uv=glGetAttribLocation(prog,"aUV"),normal=glGetAttribLocation(prog,"aNormal"),col=glGetAttribLocation(prog,"aColor");
  GLint mvpLoc=glGetUniformLocation(prog,"uMVP"),modelLoc=glGetUniformLocation(prog,"uModel"),texLoc=glGetUniformLocation(prog,"uTexture"),modeLoc=glGetUniformLocation(prog,"uTextMode");
- glEnable(GL_DEPTH_TEST);glDepthFunc(GL_LEQUAL);int run=1;SDL_Event e;float angle=0;Uint64 start=SDL_GetPerformanceCounter();int frames=0,fps=0;double freq=(double)SDL_GetPerformanceFrequency();
+ glEnable(GL_DEPTH_TEST);
+glDepthFunc(GL_LEQUAL);
+
+int run = 1;
+SDL_Event e;
+float angle = 0;
+
+Uint64 start = SDL_GetPerformanceCounter();
+Uint64 animationStart = SDL_GetPerformanceCounter();
+
+int frames = 0, fps = 0;
+double freq = (double)SDL_GetPerformanceFrequency();
  while(run){
   while(SDL_PollEvent(&e))if(e.type==SDL_QUIT||e.type==SDL_APP_TERMINATING)run=0;
+  double animationTime =
+    (SDL_GetPerformanceCounter() - animationStart) / freq;
+
+fbx_free_mesh(&frameMesh);
+
+if (fbxOK) {
+    fbxOK = fbx_build_mesh(&fbx, animationTime, &frameMesh);
+}
   int w,h;SDL_GL_GetDrawableSize(win,&w,&h);if(w<1)w=1;if(h<1)h=1;glViewport(0,0,w,h);glClearColor(.08f,.08f,.12f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
-  if(ok&&tex){
+  if(fbxOK && tex && frameMesh.vertex_count > 0){
    float c=cosf(angle),s=sinf(angle);float model[16]={c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1},trans[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,-3.5f,1},vm[16],pr[16]={0},mvp[16];mm(vm,trans,model);
    float f=1.0f/tanf(1.047198f*0.5f),aspect=(float)w/h;pr[0]=f/aspect;pr[5]=f;pr[10]=-1.002f;pr[11]=-1;pr[14]=-.2002f;mm(mvp,pr,vm);
    glUseProgram(prog);glUniform1f(modeLoc,0);glUniformMatrix4fv(mvpLoc,1,GL_FALSE,mvp);glUniformMatrix4fv(modelLoc,1,GL_FALSE,model);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,tex);glUniform1i(texLoc,0);
-   glBindBuffer(GL_ARRAY_BUFFER,meshVBO);glEnableVertexAttribArray(pos);glEnableVertexAttribArray(uv);glEnableVertexAttribArray(normal);
-   glVertexAttribPointer(pos,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)offsetof(Vertex,p));glVertexAttribPointer(uv,2,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)offsetof(Vertex,uv));glVertexAttribPointer(normal,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),(void*)offsetof(Vertex,n));glDrawArrays(GL_TRIANGLES,0,(GLsizei)mesh.count);
+   glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
+
+glBufferData(
+    GL_ARRAY_BUFFER,
+    frameMesh.vertex_count * sizeof(FBXVertex),
+    frameMesh.vertices,
+    GL_DYNAMIC_DRAW
+);
+
+glEnableVertexAttribArray(pos);
+glEnableVertexAttribArray(uv);
+glEnableVertexAttribArray(normal);
+   glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE,
+    sizeof(FBXVertex), (void*)offsetof(FBXVertex, position));
+
+glVertexAttribPointer(uv, 2, GL_FLOAT, GL_FALSE,
+    sizeof(FBXVertex), (void*)offsetof(FBXVertex, uv));
+
+glVertexAttribPointer(normal, 3, GL_FLOAT, GL_FALSE,
+    sizeof(FBXVertex), (void*)offsetof(FBXVertex, normal));
+
+glDrawArrays(GL_TRIANGLES, 0, (GLsizei)frameMesh.vertex_count);
   }
   frames++;Uint64 now=SDL_GetPerformanceCounter();if((double)(now-start)/freq>=.5){fps=(int)(frames*freq/(double)(now-start)+.5);frames=0;start=now;}
   drawFPS(prog,fpsVBO,pos,col,mvpLoc,modeLoc,w,h,fps);SDL_GL_SwapWindow(win);angle+=.008f;if(angle>6.283185f)angle-=6.283185f;
  }
- glDeleteBuffers(1,&meshVBO);glDeleteBuffers(1,&fpsVBO);if(tex)glDeleteTextures(1,&tex);glDeleteProgram(prog);free(mesh.v);SDL_GL_DeleteContext(ctx);SDL_DestroyWindow(win);SDL_Quit();return 0;
+ glDeleteBuffers(1, &meshVBO);
+glDeleteBuffers(1, &fpsVBO);
+
+if (tex)
+    glDeleteTextures(1, &tex);
+
+glDeleteProgram(prog);
+
+fbx_free_mesh(&frameMesh);
+fbx_free(&fbx);
+
+SDL_GL_DeleteContext(ctx);
+SDL_DestroyWindow(win);
+SDL_Quit();
+
+return 0;
 }
