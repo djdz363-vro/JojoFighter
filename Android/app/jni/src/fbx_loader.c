@@ -56,7 +56,45 @@ SDL_free(data);
         (unsigned)model->scene->meshes.count,
         model->duration
     );
+    for (size_t m = 0; m < model->scene->meshes.count; m++) {
+        ufbx_mesh *mesh = model->scene->meshes.data[m];
 
+        float umin = 1e30f, umax = -1e30f;
+        float vmin = 1e30f, vmax = -1e30f;
+
+        if (mesh->vertex_uv.exists) {
+            for (size_t i = 0; i < mesh->vertex_uv.values.count; i++) {
+                ufbx_vec2 uv = mesh->vertex_uv.values.data[i];
+
+                if (uv.x < umin) umin = (float)uv.x;
+                if (uv.x > umax) umax = (float)uv.x;
+                if (uv.y < vmin) vmin = (float)uv.y;
+                if (uv.y > vmax) vmax = (float)uv.y;
+            }
+        }
+        SDL_Log(
+            "MESH %u '%s': verts=%u tris=%u UV=%d U[%.2f..%.2f] V[%.2f..%.2f] skins=%u",
+            (unsigned)m,
+            mesh->name.data ? mesh->name.data : "",
+            (unsigned)mesh->num_vertices,
+            (unsigned)mesh->num_triangles,
+            (int)mesh->vertex_uv.exists,
+            umin, umax, vmin, vmax,
+            (unsigned)mesh->skin_deformers.count
+        );
+    }
+
+    for (size_t k = 0; k < model->scene->materials.count; k++) {
+        ufbx_material *mat = model->scene->materials.data[k];
+        ufbx_texture *tex = mat->fbx.diffuse_color.texture;
+
+        SDL_Log(
+            "MATERIAL %u '%s' texture: %s",
+            (unsigned)k,
+            mat->name.data ? mat->name.data : "",
+            tex && tex->filename.data ? tex->filename.data : "(none)"
+        );
+    }
     return 1;
 }
 
@@ -73,6 +111,12 @@ int fbx_build_mesh(
     ufbx_scene *scene = model->scene;
     ufbx_scene *evaluated = NULL;
     uint32_t *indices = NULL;
+
+    static Uint64 acc_eval = 0, acc_total = 0;
+    static int acc_n = 0;
+
+    Uint64 t_start = SDL_GetPerformanceCounter();
+    Uint64 t_eval_end = t_start;
 
     if (model->animation && model->duration > 0.0) {
         double local_time = fmod(time, model->duration);
@@ -98,8 +142,8 @@ int fbx_build_mesh(
         }
 
         scene = evaluated;
+        t_eval_end = SDL_GetPerformanceCounter();
     }
-
     if (scene->meshes.count == 0)
         goto fail;
 
@@ -283,6 +327,18 @@ int fbx_build_mesh(
 
     if (evaluated)
         ufbx_free_scene(evaluated);
+
+    acc_eval += t_eval_end - t_start;
+    acc_total += SDL_GetPerformanceCounter() - t_start;
+
+    if (++acc_n == 60) {
+        double f = (double)SDL_GetPerformanceFrequency() / 1000.0;
+        SDL_Log("PERF evaluate %.2f ms, total build %.2f ms",
+                acc_eval / f / 60.0, acc_total / f / 60.0);
+
+        acc_eval = acc_total = 0;
+        acc_n = 0;
+    }
 
     return 1;
 
