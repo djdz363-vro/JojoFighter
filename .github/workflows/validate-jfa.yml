@@ -1,0 +1,29 @@
+name: Validate JFA Assets
+
+on:
+  push:
+    paths:
+      - tools/jfa_convert.c
+      - tools/jfa_compare.py
+      - tools/validate_jfa.sh
+      - Android/app/jni/ufbx/ufbx.c
+      - Android/app/jni/ufbx/ufbx.h
+      - model0_*.jfa
+      - Android/app/src/main/assets/**
+      - .github/workflows/validate-jfa.yml
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build JFA converter and validate re-bake against original
+        # Strict mode (byte-identical) is expected to fail: the available
+        # Mma Idle.fbx is a re-export of the original bake source, so the
+        # comparison runs with an explicit float tolerance (--tol 1e-3),
+        # see docs/JFA1.md for the quantified differences.
+        run: sh tools/validate_jfa.sh --tol 1e-3

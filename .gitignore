@@ -1,0 +1,6 @@
+# Build output: JFA validation builds at the repo root (build/jfa/),
+# Gradle/ndk-build output under Android/ (Android/app/build/).
+build/
+
+# Python bytecode from ad-hoc tool runs
+__pycache__/
