@@ -80,7 +80,7 @@ bad: SDL_Log("OBJ parse failed");SDL_free(buf);free(p);free(uv);free(no);free(m-
 static GLuint loadBMP(const char *path){
  SDL_Surface *s=SDL_LoadBMP(path);if(!s){SDL_Log("BMP load: %s",SDL_GetError());return 0;}
  SDL_Surface *r=SDL_ConvertSurfaceFormat(s,SDL_PIXELFORMAT_RGBA32,0);SDL_FreeSurface(s);if(!r){SDL_Log("BMP convert: %s",SDL_GetError());return 0;}
- GLuint t=0;glGenTextures(1,&t);glBindTexture(GL_TEXTURE_2D,t);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);glPixelStorei(GL_UNPACK_ALIGNMENT,1);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,r->w,r->h,0,GL_RGBA,GL_UNSIGNED_BYTE,r->pixels);SDL_Log("Texture OK: %dx%d",r->w,r->h);SDL_FreeSurface(r);return t;
+ GLuint t=0;glGenTextures(1,&t);glBindTexture(GL_TEXTURE_2D,t);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT);glPixelStorei(GL_UNPACK_ALIGNMENT,1);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,r->w,r->h,0,GL_RGBA,GL_UNSIGNED_BYTE,r->pixels);SDL_Log("Texture OK: %dx%d",r->w,r->h);SDL_FreeSurface(r);return t;
 }
 static void drawFPS(GLuint prog,GLuint vbo,GLint pos,GLint col,GLint mvp,GLint mode,int w,int h,int fps){
  char str[16];snprintf(str,sizeof(str),"FPS:%d",fps);float a[16*5*7*6];int n=0;float dx=6.0f/w,dy=6.0f/h,x0=1.0f-((float)SDL_strlen(str)*18+12)*2/w,y0=1.0f-24.0f/h;
