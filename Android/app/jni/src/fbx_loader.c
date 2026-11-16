@@ -63,8 +63,8 @@ SDL_free(data);
         float vmin = 1e30f, vmax = -1e30f;
 
         if (mesh->vertex_uv.exists) {
-            for (size_t i = 0; i < mesh->vertex_uv.values.count; i++) {
-                ufbx_vec2 uv = mesh->vertex_uv.values.data[i];
+            for (size_t i = 0; i < mesh->vertex_uv.indices.count; i++) {
+                ufbx_vec2 uv = ufbx_get_vertex_vec2(&mesh->vertex_uv, i);
 
                 if (uv.x < umin) umin = (float)uv.x;
                 if (uv.x > umax) umax = (float)uv.x;
@@ -72,6 +72,7 @@ SDL_free(data);
                 if (uv.y > vmax) vmax = (float)uv.y;
             }
         }
+        
         SDL_Log(
             "MESH %u '%s': verts=%u tris=%u UV=%d U[%.2f..%.2f] V[%.2f..%.2f] skins=%u",
             (unsigned)m,
