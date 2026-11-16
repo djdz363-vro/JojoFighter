@@ -121,65 +121,109 @@ static GLuint createArenaFloor(float y) {
     return vbo;
 }
 
-static void addArenaQuad(
+static void addArenaFace(
     FloorVertex *vertices,
     size_t *count,
-    float xMin, float zMin,
-    float xMax, float zMax,
-    float y
+    const float a[3],
+    const float b[3],
+    const float c[3],
+    const float d[3],
+    float r, float g, float blue
 ) {
-    const float r = 0.28f;
-    const float g = 0.43f;
-    const float b = 0.58f;
-
-    FloorVertex quad[6] = {
-        {{xMin, y, zMin}, {0, 0}, {0, 1, 0}, {r, g, b}},
-        {{xMin, y, zMax}, {0, 0}, {0, 1, 0}, {r, g, b}},
-        {{xMax, y, zMax}, {0, 0}, {0, 1, 0}, {r, g, b}},
-
-        {{xMin, y, zMin}, {0, 0}, {0, 1, 0}, {r, g, b}},
-        {{xMax, y, zMax}, {0, 0}, {0, 1, 0}, {r, g, b}},
-        {{xMax, y, zMin}, {0, 0}, {0, 1, 0}, {r, g, b}}
+    const FloorVertex face[6] = {
+        {{a[0], a[1], a[2]}, {0, 0}, {0, 1, 0}, {r, g, blue}},
+        {{b[0], b[1], b[2]}, {0, 0}, {0, 1, 0}, {r, g, blue}},
+        {{c[0], c[1], c[2]}, {0, 0}, {0, 1, 0}, {r, g, blue}},
+        {{a[0], a[1], a[2]}, {0, 0}, {0, 1, 0}, {r, g, blue}},
+        {{c[0], c[1], c[2]}, {0, 0}, {0, 1, 0}, {r, g, blue}},
+        {{d[0], d[1], d[2]}, {0, 0}, {0, 1, 0}, {r, g, blue}}
     };
 
     for (int i = 0; i < 6; i++) {
-        vertices[*count + i] = quad[i];
+        vertices[*count + i] = face[i];
     }
 
     *count += 6;
 }
 
-static GLuint createArenaBoundary(float y) {
-    const float half = 7.3f;
-    const float width = 0.055f;
-    const float inner = half - width;
+static void addArenaBox(
+    FloorVertex *vertices,
+    size_t *count,
+    float xMin, float yMin, float zMin,
+    float xMax, float yMax, float zMax
+) {
+    const float points[8][3] = {
+        {xMin, yMin, zMin},
+        {xMax, yMin, zMin},
+        {xMax, yMin, zMax},
+        {xMin, yMin, zMax},
+        {xMin, yMax, zMin},
+        {xMax, yMax, zMin},
+        {xMax, yMax, zMax},
+        {xMin, yMax, zMax}
+    };
 
-    FloorVertex vertices[24];
+    static const int faces[6][4] = {
+        {0, 3, 2, 1},
+        {4, 5, 6, 7},
+        {0, 1, 5, 4},
+        {3, 7, 6, 2},
+        {0, 4, 7, 3},
+        {1, 2, 6, 5}
+    };
+
+    static const float colors[6][3] = {
+        {0.10f, 0.15f, 0.20f},
+        {0.31f, 0.48f, 0.64f},
+        {0.18f, 0.27f, 0.36f},
+        {0.12f, 0.19f, 0.27f},
+        {0.15f, 0.23f, 0.32f},
+        {0.23f, 0.35f, 0.47f}
+    };
+
+    for (int i = 0; i < 6; i++) {
+        addArenaFace(
+            vertices, count,
+            points[faces[i][0]],
+            points[faces[i][1]],
+            points[faces[i][2]],
+            points[faces[i][3]],
+            colors[i][0], colors[i][1], colors[i][2]
+        );
+    }
+}
+
+static GLuint createArenaWalls(
+    float groundY,
+    float wallHeight,
+    float half,
+    float thickness
+) {
+    const float inner = half - thickness;
+    const float top = groundY + wallHeight;
+
+    FloorVertex vertices[144];
     size_t count = 0;
 
-    // Back boundary
-    addArenaQuad(
-        vertices, &count,
-        -half, -half, half, -inner, y
-    );
+    // Back wall
+    addArenaBox(vertices, &count,
+        -half, groundY, -half,
+         half, top, -inner);
 
-    // Front boundary
-    addArenaQuad(
-        vertices, &count,
-        -half, inner, half, half, y
-    );
+    // Front wall
+    addArenaBox(vertices, &count,
+        -half, groundY, inner,
+         half, top, half);
 
-    // Left boundary
-    addArenaQuad(
-        vertices, &count,
-        -half, -inner, -inner, inner, y
-    );
+    // Left wall
+    addArenaBox(vertices, &count,
+        -half, groundY, -inner,
+        -inner, top, inner);
 
-    // Right boundary
-    addArenaQuad(
-        vertices, &count,
-        inner, -inner, half, inner, y
-    );
+    // Right wall
+    addArenaBox(vertices, &count,
+        inner, groundY, -inner,
+        half, top, inner);
 
     GLuint vbo = 0;
     glGenBuffers(1, &vbo);
@@ -194,6 +238,7 @@ static GLuint createArenaBoundary(float y) {
 
     return vbo;
 }
+
 
 int main(int argc,char **argv){
  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
@@ -211,19 +256,31 @@ GLuint meshVBO = 0, fpsVBO = 0;
 glGenBuffers(1, &meshVBO);
 glGenBuffers(1, &fpsVBO);
 float groundY = 0.0f;
+float characterTopY = 0.0f;
 
 if (fbxOK && frameMesh.vertex_count > 0) {
     groundY = frameMesh.vertices[0].position[1];
+    characterTopY = groundY;
 
     for (size_t i = 1; i < frameMesh.vertex_count; i++) {
-        if (frameMesh.vertices[i].position[1] < groundY) {
-            groundY = frameMesh.vertices[i].position[1];
-        }
+        float y = frameMesh.vertices[i].position[1];
+
+        if (y < groundY) groundY = y;
+        if (y > characterTopY) characterTopY = y;
     }
 }
 
+float characterHeight = characterTopY - groundY;
+if (characterHeight < 0.001f) characterHeight = 2.0f;
+
 GLuint arenaVBO = createArenaFloor(groundY - 0.02f);
-GLuint arenaBoundaryVBO = createArenaBoundary(groundY - 0.015f);
+GLuint arenaWallsVBO = createArenaWalls(
+    groundY - 0.02f,
+    characterHeight * 1.1f,
+    4.2f,
+    characterHeight * 0.08f
+);
+
 if (fbxOK && frameMesh.vertex_count > 0) {
     glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
     glBufferData(
@@ -297,7 +354,7 @@ glVertexAttribPointer(col, 3, GL_FLOAT, GL_FALSE,
 
 glDrawArrays(GL_TRIANGLES, 0, 6);
 
-glBindBuffer(GL_ARRAY_BUFFER, arenaBoundaryVBO);
+glBindBuffer(GL_ARRAY_BUFFER, arenaWallsVBO);
 
 glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE,
     sizeof(FloorVertex), (void*)offsetof(FloorVertex, position));
@@ -311,7 +368,7 @@ glVertexAttribPointer(normal, 3, GL_FLOAT, GL_FALSE,
 glVertexAttribPointer(col, 3, GL_FLOAT, GL_FALSE,
     sizeof(FloorVertex), (void*)offsetof(FloorVertex, color));
 
-glDrawArrays(GL_TRIANGLES, 0, 24);
+glDrawArrays(GL_TRIANGLES, 0, 144);
 
 glUseProgram(prog);glUniform1f(modeLoc,0);
 glDisableVertexAttribArray(col);
@@ -346,7 +403,7 @@ glDrawArrays(GL_TRIANGLES, 0, (GLsizei)frameMesh.vertex_count);
  glDeleteBuffers(1, &meshVBO);
 glDeleteBuffers(1, &fpsVBO);
 glDeleteBuffers(1, &arenaVBO);
-glDeleteBuffers(1, &arenaBoundaryVBO);
+glDeleteBuffers(1, &arenaWallsVBO);
 if (tex)
     glDeleteTextures(1, &tex);
 
