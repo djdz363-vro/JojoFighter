@@ -6,6 +6,12 @@
 #include <string.h>
 #include <stddef.h>
 #include "fbx_loader.h"
+typedef struct {
+    float position[3];
+    float uv[2];
+    float normal[3];
+    float color[3];
+} FloorVertex;
 
 typedef struct { float p[3], uv[2], n[3]; } Vertex;
 typedef struct { Vertex *v; size_t count, cap; } Mesh;
@@ -88,7 +94,32 @@ static void drawFPS(GLuint prog,GLuint vbo,GLint pos,GLint col,GLint mvp,GLint m
  const float id[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1};glDisable(GL_DEPTH_TEST);glUseProgram(prog);glUniformMatrix4fv(mvp,1,GL_FALSE,id);glUniform1f(mode,1);
  glBindBuffer(GL_ARRAY_BUFFER,vbo);glBufferData(GL_ARRAY_BUFFER,n*sizeof(float),a,GL_DYNAMIC_DRAW);glEnableVertexAttribArray(pos);glEnableVertexAttribArray(col);glVertexAttribPointer(pos,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);glVertexAttribPointer(col,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));glDrawArrays(GL_POINTS,0,n/6);glEnable(GL_DEPTH_TEST);
 }
+static GLuint createArenaFloor(float y) {
+    const float half = 8.0f;
 
+    const FloorVertex floorVertices[] = {
+        {{-half, y, -half}, {0, 0}, {0, 1, 0}, {0.13f, 0.16f, 0.21f}},
+        {{-half, y,  half}, {0, 0}, {0, 1, 0}, {0.13f, 0.16f, 0.21f}},
+        {{ half, y,  half}, {0, 0}, {0, 1, 0}, {0.13f, 0.16f, 0.21f}},
+
+        {{-half, y, -half}, {0, 0}, {0, 1, 0}, {0.13f, 0.16f, 0.21f}},
+        {{ half, y,  half}, {0, 0}, {0, 1, 0}, {0.13f, 0.16f, 0.21f}},
+        {{ half, y, -half}, {0, 0}, {0, 1, 0}, {0.13f, 0.16f, 0.21f}}
+    };
+
+    GLuint vbo = 0;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        sizeof(floorVertices),
+        floorVertices,
+        GL_STATIC_DRAW
+    );
+
+    return vbo;
+}
 int main(int argc,char **argv){
  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
  if(SDL_Init(SDL_INIT_VIDEO)!=0){SDL_Log("SDL: %s",SDL_GetError());return 1;}
@@ -104,7 +135,19 @@ GLuint tex = loadBMP("model0.bmp");
 GLuint meshVBO = 0, fpsVBO = 0;
 glGenBuffers(1, &meshVBO);
 glGenBuffers(1, &fpsVBO);
+float groundY = 0.0f;
 
+if (fbxOK && frameMesh.vertex_count > 0) {
+    groundY = frameMesh.vertices[0].position[1];
+
+    for (size_t i = 1; i < frameMesh.vertex_count; i++) {
+        if (frameMesh.vertices[i].position[1] < groundY) {
+            groundY = frameMesh.vertices[i].position[1];
+        }
+    }
+}
+
+GLuint arenaVBO = createArenaFloor(groundY - 0.02f);
 if (fbxOK && frameMesh.vertex_count > 0) {
     glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
     glBufferData(
@@ -142,7 +185,45 @@ if (fbxOK) {
   if(fbxOK && tex && frameMesh.vertex_count > 0){
    float c=cosf(angle),s=sinf(angle);float model[16]={c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1},trans[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,-3.5f,1},vm[16],pr[16]={0},mvp[16];mm(vm,trans,model);
    float f=1.0f/tanf(1.047198f*0.5f),aspect=(float)w/h;pr[0]=f/aspect;pr[5]=f;pr[10]=-1.002f;pr[11]=-1;pr[14]=-.2002f;mm(mvp,pr,vm);
-   glUseProgram(prog);glUniform1f(modeLoc,0);glUniformMatrix4fv(mvpLoc,1,GL_FALSE,mvp);glUniformMatrix4fv(modelLoc,1,GL_FALSE,model);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,tex);glUniform1i(texLoc,0);
+   float identity[16] = {
+    1,0,0,0,
+    0,1,0,0,
+    0,0,1,0,
+    0,0,0,1
+};
+
+float floorMVP[16];
+mm(floorMVP, pr, trans);
+
+glUseProgram(prog);
+glUniform1f(modeLoc, 1.0f);
+glUniformMatrix4fv(mvpLoc, 1, GL_FALSE, floorMVP);
+glUniformMatrix4fv(modelLoc, 1, GL_FALSE, identity);
+
+glBindBuffer(GL_ARRAY_BUFFER, arenaVBO);
+
+glEnableVertexAttribArray(pos);
+glEnableVertexAttribArray(uv);
+glEnableVertexAttribArray(normal);
+glEnableVertexAttribArray(col);
+
+glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE,
+    sizeof(FloorVertex), (void*)offsetof(FloorVertex, position));
+
+glVertexAttribPointer(uv, 2, GL_FLOAT, GL_FALSE,
+    sizeof(FloorVertex), (void*)offsetof(FloorVertex, uv));
+
+glVertexAttribPointer(normal, 3, GL_FLOAT, GL_FALSE,
+    sizeof(FloorVertex), (void*)offsetof(FloorVertex, normal));
+
+glVertexAttribPointer(col, 3, GL_FLOAT, GL_FALSE,
+    sizeof(FloorVertex), (void*)offsetof(FloorVertex, color));
+
+glDrawArrays(GL_TRIANGLES, 0, 6);
+glUseProgram(prog);glUniform1f(modeLoc,0);
+glDisableVertexAttribArray(col);
+glVertexAttrib3f(col, 1.0f, 1.0f, 1.0f);
+   glUniformMatrix4fv(mvpLoc,1,GL_FALSE,mvp);glUniformMatrix4fv(modelLoc,1,GL_FALSE,model);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,tex);glUniform1i(texLoc,0);
    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
 
 glBufferData(
@@ -171,6 +252,7 @@ glDrawArrays(GL_TRIANGLES, 0, (GLsizei)frameMesh.vertex_count);
  }
  glDeleteBuffers(1, &meshVBO);
 glDeleteBuffers(1, &fpsVBO);
+glDeleteBuffers(1, &arenaVBO);
 
 if (tex)
     glDeleteTextures(1, &tex);
