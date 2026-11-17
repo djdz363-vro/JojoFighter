@@ -178,17 +178,19 @@ static void jfa_dpad_motion(JFADpad *d, SDL_FingerID id,
 {
     int dest = jfa_dpad_hit(nx, ny, vw, vh);
     for (int i = 0; i < 4; i++) {
+        int j;
         if (d->finger[i] != id)
             continue;
-        if (dest == (1 << i))
-            return; /* still on the same button */
-        d->finger[i] = -1; /* release the old direction */
-        /* Transfer ownership if the new button is free; never steal
-         * a button already held by another finger. */
-        if (dest) {
-            int j = jfa_dpad_index(dest);
-            if (d->finger[j] < 0)
-                d->finger[j] = id;
+        /* Sliding through a GAP must NOT drop finger ownership: keep
+         * the current direction until another button is entered. */
+        if (dest == 0 || dest == (1 << i))
+            return;
+        j = jfa_dpad_index(dest);
+        /* Never steal a button already held by a different finger;
+         * in that case keep the old direction until release. */
+        if (d->finger[j] < 0 || j == i) {
+            d->finger[i] = -1;
+            d->finger[j] = id;
         }
         return;
     }
@@ -210,6 +212,31 @@ static unsigned jfa_dpad_mask(const JFADpad *d)
     if (d->finger[3] >= 0) mask |= JFA_DIR_RIGHT;
     return mask;
 }
+
+/* TEMPORARY device diagnostics: shows raw SDL finger coordinates, the
+ * window size used for hit-testing, the GL drawable size, the resolved
+ * button and the resulting direction mask. Set JFA_DPAD_DEBUG=0 to
+ * silence after the device issue is diagnosed. */
+#ifndef JFA_DPAD_DEBUG
+#define JFA_DPAD_DEBUG 1
+#endif
+#if JFA_DPAD_DEBUG
+static void jfa_dpad_log(SDL_Window *win, const char *what,
+                         SDL_FingerID id, float nx, float ny,
+                         int vw, int vh, unsigned mask)
+{
+    int dw = 0, dh = 0;
+    SDL_GL_GetDrawableSize(win, &dw, &dh);
+    SDL_Log("JFA DPAD %s finger=%lld xy=(%.3f,%.3f) window=%dx%d "
+            "drawable=%dx%d hit=%d mask=%u",
+            what, (long long)id, (double)nx, (double)ny, vw, vh,
+            dw, dh, jfa_dpad_hit(nx, ny, vw, vh), mask);
+}
+#define JFA_DPAD_LOG(win, what, id, nx, ny, vw, vh, mask) \
+    jfa_dpad_log((win), (what), (id), (nx), (ny), (vw), (vh), (mask))
+#else
+#define JFA_DPAD_LOG(win, what, id, nx, ny, vw, vh, mask) do {} while (0)
+#endif
 
 /* PSP-style D-pad overlay: four pentagonal buttons with arrow glyphs.
  * Uses only the existing flat-color program path (uTextMode=1) and a
@@ -236,8 +263,15 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
     jfa_dpad_geom(w, h, &gg);
 
 #define DPV(nx, ny, r, g, b) do { \
-    v[n++] = 2.0f * (nx) - 1.0f; \
-    v[n++] = 1.0f - 2.0f * (ny); \
+    float px_ = (nx), py_ = (ny); \
+    /* Defensive clamp: malformed/scaled device coordinates must never
+     * produce giant off-screen triangles over the arena. */ \
+    if (px_ < 0.0f) px_ = 0.0f; \
+    if (px_ > 1.0f) px_ = 1.0f; \
+    if (py_ < 0.0f) py_ = 0.0f; \
+    if (py_ > 1.0f) py_ = 1.0f; \
+    v[n++] = 2.0f * px_ - 1.0f; \
+    v[n++] = 1.0f - 2.0f * py_; \
     v[n++] = 0.0f; v[n++] = r; v[n++] = g; v[n++] = b; \
 } while (0)
 
@@ -845,11 +879,24 @@ double freq = (double)SDL_GetPerformanceFrequency();
     else if (e.type == SDL_FINGERDOWN) {
         jfa_dpad_down(&dpad, e.tfinger.fingerId,
                       e.tfinger.x, e.tfinger.y, inputW, inputH);
+        JFA_DPAD_LOG(win, "DOWN", e.tfinger.fingerId,
+                     e.tfinger.x, e.tfinger.y, inputW, inputH,
+                     jfa_dpad_mask(&dpad));
     } else if (e.type == SDL_FINGERMOTION) {
+        const unsigned before = jfa_dpad_mask(&dpad);
         jfa_dpad_motion(&dpad, e.tfinger.fingerId,
                         e.tfinger.x, e.tfinger.y, inputW, inputH);
+        const unsigned after = jfa_dpad_mask(&dpad);
+        if (after != before)
+            JFA_DPAD_LOG(win, "MOVE", e.tfinger.fingerId,
+                         e.tfinger.x, e.tfinger.y, inputW, inputH, after);
     } else if (e.type == SDL_FINGERUP) {
+        const unsigned before = jfa_dpad_mask(&dpad);
         jfa_dpad_up(&dpad, e.tfinger.fingerId);
+        if (before != jfa_dpad_mask(&dpad))
+            JFA_DPAD_LOG(win, "UP", e.tfinger.fingerId,
+                         e.tfinger.x, e.tfinger.y, inputW, inputH,
+                         jfa_dpad_mask(&dpad));
     }
   }
   double animationTime =
