@@ -66,6 +66,31 @@ static GLuint programCreate(void){
 static void mm(float *o,const float *a,const float *b){
  float r[16];for(int c=0;c<4;c++)for(int y=0;y<4;y++){r[c*4+y]=0;for(int k=0;k<4;k++)r[c*4+y]+=a[k*4+y]*b[c*4+k];}memcpy(o,r,sizeof(r));
 }
+
+/* ---- M3.1-A: one movement step (pure math, desktop-testable).
+ * pos[0]/pos[1] are X/Z; Y is never touched (character stays grounded).
+ * dt is clamped here so a long pause cannot teleport through a wall. */
+static void jfa_move_step(float pos[2], float *facing,
+                          float dx, float dz, double dt, float limit)
+{
+ const float speed = 3.0f; /* world units per second */
+ float len;
+
+ if (dt < 0.0) dt = 0.0;
+ if (dt > 0.05) dt = 0.05;
+ len = sqrtf(dx * dx + dz * dz);
+ if (len > 0.0f) {
+     dx /= len;
+     dz /= len;              /* diagonal is not faster than straight */
+     *facing = atan2f(dx, dz);
+     pos[0] += dx * speed * (float)dt;
+     pos[1] += dz * speed * (float)dt;
+ }
+ if (pos[0] < -limit) pos[0] = -limit;
+ if (pos[0] >  limit) pos[0] =  limit;
+ if (pos[1] < -limit) pos[1] = -limit;
+ if (pos[1] >  limit) pos[1] =  limit;
+}
 static int push(Mesh *m,Vertex v){
  if(m->count==m->cap){size_t n=m->cap?m->cap*2:4096;Vertex *p=(Vertex*)realloc(m->v,n*sizeof(Vertex));if(!p)return 0;m->v=p;m->cap=n;}m->v[m->count++]=v;return 1;
 }
@@ -515,7 +540,14 @@ glDepthFunc(GL_LEQUAL);
 
 int run = 1;
 SDL_Event e;
-float angle = 0;
+
+/* ---- M3.1-A: basic character movement (keyboard, development only).
+ * charPos[0]/[1] are X/Z in the arena; Y stays 0 (grounded).
+ * charFacing replaces the old static turntable angle ('angle'). ---- */
+static float charPos[2] = { 0.0f, 0.0f };
+static float charFacing = 0.0f;
+static Uint64 moveLastCounter = 0;
+static int moveTimeValid = 0;
 
 Uint64 start = SDL_GetPerformanceCounter();
 Uint64 animationStart = SDL_GetPerformanceCounter();
@@ -527,6 +559,29 @@ double freq = (double)SDL_GetPerformanceFrequency();
   double animationTime =
     (SDL_GetPerformanceCounter() - animationStart) / freq;
 
+  /* ---- M3.1-A: keyboard movement (WASD + arrows), development only ---- */
+  {
+    const Uint8 *keys = SDL_GetKeyboardState(NULL);
+    float dx = 0.0f, dz = 0.0f;
+    if (keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT])  dx -= 1.0f;
+    if (keys[SDL_SCANCODE_D] || keys[SDL_SCANCODE_RIGHT]) dx += 1.0f;
+    if (keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_UP])    dz -= 1.0f;
+    if (keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_DOWN])  dz += 1.0f;
+
+    Uint64 counter = SDL_GetPerformanceCounter();
+    double dt = moveTimeValid ?
+        (double)(counter - moveLastCounter) / freq : 0.0;
+    moveLastCounter = counter;
+    moveTimeValid = 1;
+    /* Wall inner face is at (arena half - wall thickness); keep a
+     * body radius margin so the character cannot clip walls or
+     * escape through corners. Y is intentionally untouched (0). */
+    const float arenaHalf = 4.2f;
+    const float wallThickness = characterHeight * 0.08f;
+    const float limit = arenaHalf - wallThickness - 0.35f;
+    jfa_move_step(charPos, &charFacing, dx, dz, dt, limit);
+  }
+
 if (!jfaOK) {
     /* FBX fallback: rebuild the mesh on the CPU every frame (existing path). */
     fbx_free_mesh(&frameMesh);
@@ -537,7 +592,15 @@ if (!jfaOK) {
 }
   int w,h;SDL_GL_GetDrawableSize(win,&w,&h);if(w<1)w=1;if(h<1)h=1;glViewport(0,0,w,h);glClearColor(.08f,.08f,.12f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
   if(tex && (jfaOK || (fbxOK && frameMesh.vertex_count > 0))){
-   float c=cosf(angle),s=sinf(angle);float model[16]={c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1},trans[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,-1.1f,-3.5f,1},vm[16],pr[16]={0},mvp[16];mm(vm,trans,model);
+   float c=cosf(charFacing),s=sinf(charFacing);
+   /* Fixed scene transform (also used for arena) is kept separate
+    * from the character translation so the arena never moves. */
+   float sceneTrans[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,-1.1f,-3.5f,1};
+   float charTrans[16]={1,0,0,0,0,1,0,0,0,0,1,0,charPos[0],0.0f,charPos[1],1};
+   float model[16]={c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1};
+   float charScene[16],vm[16],pr[16]={0},mvp[16];
+   mm(charScene, sceneTrans, charTrans);
+   mm(vm, charScene, model);
    float f=1.0f/tanf(1.047198f*0.5f),aspect=(float)w/h;pr[0]=f/aspect;pr[5]=f;pr[10]=-1.002f;pr[11]=-1;pr[14]=-.2002f;mm(mvp,pr,vm);
    float identity[16] = {
     1,0,0,0,
@@ -547,7 +610,7 @@ if (!jfaOK) {
 };
 
 float floorMVP[16];
-mm(floorMVP, pr, trans);
+mm(floorMVP, pr, sceneTrans); /* arena stays fixed: no character offset */
 
 glUseProgram(prog);
 glUniform1f(modeLoc, 1.0f);
