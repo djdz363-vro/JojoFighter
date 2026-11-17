@@ -507,7 +507,7 @@ glVertexAttribPointer(normal, 3, GL_FLOAT, GL_FALSE,
 glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
   }
   frames++;Uint64 now=SDL_GetPerformanceCounter();if((double)(now-start)/freq>=.5){fps=(int)(frames*freq/(double)(now-start)+.5);frames=0;start=now;}
-  drawFPS(prog,fpsVBO,pos,col,mvpLoc,modeLoc,w,h,fps);SDL_GL_SwapWindow(win);angle+=.008f;if(angle>6.283185f)angle-=6.283185f;
+  drawFPS(prog,fpsVBO,pos,col,mvpLoc,modeLoc,w,h,fps);SDL_GL_SwapWindow(win);
  }
  glDeleteBuffers(1, &meshVBO);
 glDeleteBuffers(1, &fpsVBO);
