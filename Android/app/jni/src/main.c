@@ -6,6 +6,24 @@
 #include <string.h>
 #include <stddef.h>
 #include "fbx_loader.h"
+#include "jfa_skin.h"
+
+/* ------------------------------------------------------------------ */
+/* JFA character state (Stage B). Loaded once; all per-frame work      */
+/* reuses these buffers - no allocation in the render loop.            */
+/* ------------------------------------------------------------------ */
+static JFACharacter jfa;
+static JFASkinned jfaSkin;
+static int jfaOK = 0;
+static int jfaClip = JFA_IDLE;
+static double jfaClipStart = 0.0;   /* animationTime when clip began */
+static double jfaClipDur = 0.0;     /* seconds of the current clip */
+static float jfaScale = 1.0f;
+static float jfaCenter[3] = { 0, 0, 0 };
+/* PERF accumulators (like fbx_loader.c): averaged over 60 frames. */
+static double jfaAccSkin = 0.0, jfaAccUpload = 0.0, jfaAccDraw = 0.0;
+static int jfaAccN = 0;
+
 typedef struct {
     float position[3];
     float uv[2];
@@ -249,14 +267,48 @@ int main(int argc,char **argv){
  GLuint prog=programCreate();if(!prog){SDL_GL_DeleteContext(ctx);SDL_DestroyWindow(win);SDL_Quit();return 1;}
 FBXModel fbx = {0};
 FBXMesh frameMesh = {0};
-int fbxOK = fbx_load(&fbx, "Mma Idle.fbx");
-if (fbxOK) fbxOK = fbx_build_mesh(&fbx, 0.0, &frameMesh);
-GLuint tex = loadBMP("model0.bmp");
+int fbxOK = 0;
+GLuint tex = 0;
 GLuint meshVBO = 0, fpsVBO = 0;
-glGenBuffers(1, &meshVBO);
-glGenBuffers(1, &fpsVBO);
 float groundY = 0.0f;
 float characterTopY = 0.0f;
+
+/* ---- JFA path: load the character once; FBX renderer is the fallback ---- */
+{
+	char jerr[512] = { 0 };
+	jfaOK = jfa_load_all(&jfa, "animations", jerr, sizeof(jerr));
+	if (jfaOK) {
+		jfa_skin_setup(&jfa, 2.2f, &jfaScale, jfaCenter);
+		if (!jfa_skin_alloc(&jfaSkin, (size_t)jfa.nv)) {
+			SDL_Log("JFA skin alloc failed - falling back to FBX");
+			jfa_free(&jfa);
+			jfaOK = 0;
+		}
+	}
+	if (jfaOK) {
+		/* UVs never change: fill them once here, not every frame
+		 * (same trick as the PSP loader). V is flipped for GLES. */
+		for (size_t i = 0; i < (size_t)jfa.nv; i++) {
+			jfaSkin.v[i].uv[0] = jfa.v[i].uv[0];
+			jfaSkin.v[i].uv[1] = 1.0f - jfa.v[i].uv[1];
+		}
+		/* posed local space: feet at y=0, height ~2.2 */
+		groundY = 0.0f;
+		characterTopY = 2.2f;
+		SDL_Log("JFA renderer active: %d bones, %d verts, %d clips, scale %.3f",
+			jfa.nb, jfa.nv, JFA_CLIP_COUNT, (double)jfaScale);
+	} else {
+		SDL_Log("JFA load failed (%s) - using FBX fallback",
+			jerr[0] ? jerr : "unknown error");
+	}
+}
+if (!jfaOK) {
+	fbxOK = fbx_load(&fbx, "Mma Idle.fbx");
+	if (fbxOK) fbxOK = fbx_build_mesh(&fbx, 0.0, &frameMesh);
+}
+tex = loadBMP("model0.bmp");
+glGenBuffers(1, &meshVBO);
+glGenBuffers(1, &fpsVBO);
 
 if (fbxOK && frameMesh.vertex_count > 0) {
     groundY = frameMesh.vertices[0].position[1];
@@ -281,12 +333,21 @@ GLuint arenaWallsVBO = createArenaWalls(
     characterHeight * 0.08f
 );
 
-if (fbxOK && frameMesh.vertex_count > 0) {
+if (!jfaOK && fbxOK && frameMesh.vertex_count > 0) {
     glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
     glBufferData(
         GL_ARRAY_BUFFER,
         frameMesh.vertex_count * sizeof(FBXVertex),
         frameMesh.vertices,
+        GL_DYNAMIC_DRAW
+    );
+} else if (jfaOK) {
+    /* Reserve the VBO once; every frame only calls glBufferSubData. */
+    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        (size_t)jfa.nv * sizeof(JFASkinVertex),
+        NULL,
         GL_DYNAMIC_DRAW
     );
 }
@@ -309,13 +370,16 @@ double freq = (double)SDL_GetPerformanceFrequency();
   double animationTime =
     (SDL_GetPerformanceCounter() - animationStart) / freq;
 
-fbx_free_mesh(&frameMesh);
+if (!jfaOK) {
+    /* FBX fallback: rebuild the mesh on the CPU every frame (existing path). */
+    fbx_free_mesh(&frameMesh);
 
-if (fbxOK) {
-    fbxOK = fbx_build_mesh(&fbx, animationTime, &frameMesh);
+    if (fbxOK) {
+        fbxOK = fbx_build_mesh(&fbx, animationTime, &frameMesh);
+    }
 }
   int w,h;SDL_GL_GetDrawableSize(win,&w,&h);if(w<1)w=1;if(h<1)h=1;glViewport(0,0,w,h);glClearColor(.08f,.08f,.12f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
-  if(fbxOK && tex && frameMesh.vertex_count > 0){
+  if(tex && (jfaOK || (fbxOK && frameMesh.vertex_count > 0))){
    float c=cosf(angle),s=sinf(angle);float model[16]={c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1},trans[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,0,-3.5f,1},vm[16],pr[16]={0},mvp[16];mm(vm,trans,model);
    float f=1.0f/tanf(1.047198f*0.5f),aspect=(float)w/h;pr[0]=f/aspect;pr[5]=f;pr[10]=-1.002f;pr[11]=-1;pr[14]=-.2002f;mm(mvp,pr,vm);
    float identity[16] = {
@@ -376,12 +440,57 @@ glVertexAttrib3f(col, 1.0f, 1.0f, 1.0f);
    glUniformMatrix4fv(mvpLoc,1,GL_FALSE,mvp);glUniformMatrix4fv(modelLoc,1,GL_FALSE,model);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,tex);glUniform1i(texLoc,0);
    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
 
-glBufferData(
-    GL_ARRAY_BUFFER,
-    frameMesh.vertex_count * sizeof(FBXVertex),
-    frameMesh.vertices,
-    GL_DYNAMIC_DRAW
-);
+size_t drawCount = 0;
+if (jfaOK) {
+    /* ---- JFA: CPU skin the current clip frame, then one sub-data upload ---- */
+    const JFAClip *clip = &jfa.clips[jfaClip];
+    jfaClipDur = (double)clip->frames / (double)clip->fps;
+    if (animationTime - jfaClipStart >= jfaClipDur) {
+        jfaClip = (jfaClip + 1) % JFA_CLIP_COUNT;
+        jfaClipStart = animationTime;
+        clip = &jfa.clips[jfaClip];
+        jfaClipDur = (double)clip->frames / (double)clip->fps;
+        SDL_Log("JFA clip: %s (%d frames @ %u fps)",
+            jfa_clip_suffix[jfaClip], clip->frames, (unsigned)clip->fps);
+    }
+    int af = jfa_skin_frame_index(clip, animationTime - jfaClipStart);
+
+    Uint64 tSkin0 = SDL_GetPerformanceCounter();
+    const float worldPos[3] = { 0.0f, 0.0f, 0.0f };
+    jfa_skin_frame(&jfa, jfaClip, af, jfaScale, jfaCenter, worldPos,
+        &jfaSkin);
+    Uint64 tSkin1 = SDL_GetPerformanceCounter();
+
+    glBufferSubData(
+        GL_ARRAY_BUFFER,
+        0,
+        (size_t)jfa.nv * sizeof(JFASkinVertex),
+        jfaSkin.v
+    );
+    Uint64 tUpload1 = SDL_GetPerformanceCounter();
+
+    jfaAccSkin += (double)(tSkin1 - tSkin0);
+    jfaAccUpload += (double)(tUpload1 - tSkin1);
+    jfaAccDraw += (double)(tUpload1 - tSkin0);
+    if (++jfaAccN == 60) {
+        double ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
+        SDL_Log("PERF jfa skin %.2f ms, upload %.2f ms, skin+upload %.2f ms",
+            jfaAccSkin * ms / 60.0,
+            jfaAccUpload * ms / 60.0,
+            jfaAccDraw * ms / 60.0);
+        jfaAccSkin = jfaAccUpload = jfaAccDraw = 0.0;
+        jfaAccN = 0;
+    }
+    drawCount = (size_t)jfa.nv;
+} else {
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        frameMesh.vertex_count * sizeof(FBXVertex),
+        frameMesh.vertices,
+        GL_DYNAMIC_DRAW
+    );
+    drawCount = frameMesh.vertex_count;
+}
 
 glEnableVertexAttribArray(pos);
 glEnableVertexAttribArray(uv);
@@ -395,7 +504,7 @@ glVertexAttribPointer(uv, 2, GL_FLOAT, GL_FALSE,
 glVertexAttribPointer(normal, 3, GL_FLOAT, GL_FALSE,
     sizeof(FBXVertex), (void*)offsetof(FBXVertex, normal));
 
-glDrawArrays(GL_TRIANGLES, 0, (GLsizei)frameMesh.vertex_count);
+glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
   }
   frames++;Uint64 now=SDL_GetPerformanceCounter();if((double)(now-start)/freq>=.5){fps=(int)(frames*freq/(double)(now-start)+.5);frames=0;start=now;}
   drawFPS(prog,fpsVBO,pos,col,mvpLoc,modeLoc,w,h,fps);SDL_GL_SwapWindow(win);angle+=.008f;if(angle>6.283185f)angle-=6.283185f;
@@ -408,6 +517,11 @@ if (tex)
     glDeleteTextures(1, &tex);
 
 glDeleteProgram(prog);
+
+if (jfaOK) {
+    jfa_skin_free(&jfaSkin);
+    jfa_free(&jfa);
+}
 
 fbx_free_mesh(&frameMesh);
 fbx_free(&fbx);
