@@ -366,13 +366,35 @@ if (!jfaOK && fbxOK && frameMesh.vertex_count > 0) {
 GLuint jfaGpuProg = 0;
 GLint jfaGpuBoneLoc = -1;
 int jfaGpuOK = 0;
+#if !JFA_GPU_RENDER
 static int jfaGpuAccN = 0;
+#endif
 static float jfaBoneStage[JFA_GPU_BONE_VECS * 4]; /* 99 vec4 staging */
 /* Substage B: prepared static GPU vertex data. jfaGpuVerts stays NULL
  * on ANY preparation failure - that only disables the (not yet used)
  * GPU draw path later; the CPU renderer keeps rendering regardless. */
 static JFAGpuVertex *jfaGpuVerts = NULL;
 static GLuint jfaGpuVbo = 0;
+/* Substage C: runtime render-mode switch. JFA_GPU_RENDER (0/1) is a
+ * compile-time switch, defaulting to 0:
+ *   JFA_GPU_SKIN off               -> CPU-only build (no GPU code)
+ *   JFA_GPU_SKIN on, RENDER=0      -> prep + matrix validation only;
+ *                                     CPU path renders (Stage A mode)
+ *   JFA_GPU_SKIN on, RENDER=1      -> GPU path draws when every
+ *                                     runtime check passes; any
+ *                                     failure falls back to CPU. */
+#ifndef JFA_GPU_RENDER
+#define JFA_GPU_RENDER 0
+#endif
+#if JFA_GPU_RENDER
+int jfaGpuRenderReady = 0;
+GLint jfaGpuPosLoc = -1, jfaGpuUvLoc = -1, jfaGpuNrmLoc = -1;
+GLint jfaGpuBoneIdxLoc = -1, jfaGpuBoneWgtLoc = -1;
+GLint jfaGpuMvpLoc = -1, jfaGpuModelLoc = -1, jfaGpuTexLoc = -1,
+	jfaGpuModeLoc = -1;
+static double jfaGpuDrawAcc = 0.0;
+static int jfaGpuDrawN = 0;
+#endif
 {
 	GLint maxVUV = 0;
 	glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &maxVUV);
@@ -453,6 +475,40 @@ if (jfaGpuOK && jfaOK && jfa.nv > 0) {
 		}
 	}
 }
+#if JFA_GPU_RENDER
+/* Substage C: query the GPU program's attribute and uniform
+ * locations and validate the remaining hardware limits. Any failure
+ * leaves jfaGpuRenderReady = 0 -> the CPU path renders. */
+if (jfaGpuOK && jfaGpuVerts && jfaGpuVbo) {
+	GLint maxAttribs = 0;
+	glGetIntegerv(GL_MAX_VERTEX_ATTRIBS, &maxAttribs);
+	jfaGpuPosLoc = glGetAttribLocation(jfaGpuProg, "aPosition");
+	jfaGpuUvLoc = glGetAttribLocation(jfaGpuProg, "aUV");
+	jfaGpuNrmLoc = glGetAttribLocation(jfaGpuProg, "aNormal");
+	jfaGpuBoneIdxLoc = glGetAttribLocation(jfaGpuProg, "aBoneIndex");
+	jfaGpuBoneWgtLoc = glGetAttribLocation(jfaGpuProg, "aBoneWeight");
+	jfaGpuMvpLoc = glGetUniformLocation(jfaGpuProg, "uMVP");
+	jfaGpuModelLoc = glGetUniformLocation(jfaGpuProg, "uModel");
+	jfaGpuTexLoc = glGetUniformLocation(jfaGpuProg, "uTexture");
+	jfaGpuModeLoc = glGetUniformLocation(jfaGpuProg, "uTextMode");
+	if (maxAttribs < 5 || jfaGpuPosLoc < 0 || jfaGpuUvLoc < 0 ||
+	    jfaGpuNrmLoc < 0 || jfaGpuBoneIdxLoc < 0 ||
+	    jfaGpuBoneWgtLoc < 0 || jfaGpuMvpLoc < 0 ||
+	    jfaGpuModelLoc < 0 || jfaGpuTexLoc < 0 ||
+	    jfaGpuModeLoc < 0) {
+		SDL_Log("JFA GPU render: locations/limits fail (maxAttribs=%d, pos=%d, uv=%d, nrm=%d, bidx=%d, bwgt=%d, mvp=%d, model=%d, tex=%d, mode=%d) - CPU path",
+			maxAttribs, jfaGpuPosLoc, jfaGpuUvLoc,
+			jfaGpuNrmLoc, jfaGpuBoneIdxLoc, jfaGpuBoneWgtLoc,
+			jfaGpuMvpLoc, jfaGpuModelLoc, jfaGpuTexLoc,
+			jfaGpuModeLoc);
+	} else {
+		jfaGpuRenderReady = 1;
+		SDL_Log("JFA GPU render active: %d verts, attribs %d/%d/%d/%d/%d (Stage C: GPU path draws, CPU is fallback)",
+			jfa.nv, jfaGpuPosLoc, jfaGpuUvLoc, jfaGpuNrmLoc,
+			jfaGpuBoneIdxLoc, jfaGpuBoneWgtLoc);
+	}
+}
+#endif
 #endif
  glEnable(GL_DEPTH_TEST);
 glDepthFunc(GL_LEQUAL);
@@ -542,22 +598,99 @@ glVertexAttrib3f(col, 1.0f, 1.0f, 1.0f);
    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
 
 size_t drawCount = 0;
+const JFAClip *jfaCur = NULL;
+int af = 0;
+const float worldPos[3] = { 0.0f, 0.0f, 0.0f };
 if (jfaOK) {
-    /* ---- JFA: CPU skin the current clip frame, then one sub-data upload ---- */
-    const JFAClip *clip = &jfa.clips[jfaClip];
-    jfaClipDur = (double)clip->frames / (double)clip->fps;
+    /* ---- Animation advance (shared by CPU and GPU paths): the
+     * clip cycle and sampled frame are computed identically for
+     * both render paths - timing never depends on which one draws. ---- */
+    jfaCur = &jfa.clips[jfaClip];
+    jfaClipDur = (double)jfaCur->frames / (double)jfaCur->fps;
     if (animationTime - jfaClipStart >= jfaClipDur) {
         jfaClip = (jfaClip + 1) % JFA_CLIP_COUNT;
         jfaClipStart = animationTime;
-        clip = &jfa.clips[jfaClip];
-        jfaClipDur = (double)clip->frames / (double)clip->fps;
+        jfaCur = &jfa.clips[jfaClip];
+        jfaClipDur = (double)jfaCur->frames / (double)jfaCur->fps;
         SDL_Log("JFA clip: %s (%d frames @ %u fps)",
-            jfa_clip_suffix[jfaClip], clip->frames, (unsigned)clip->fps);
+            jfa_clip_suffix[jfaClip], jfaCur->frames,
+            (unsigned)jfaCur->fps);
     }
-    int af = jfa_skin_frame_index(clip, animationTime - jfaClipStart);
-
+    af = jfa_skin_frame_index(jfaCur, animationTime - jfaClipStart);
+}
+#if JFA_GPU_SKIN && JFA_GPU_RENDER
+int gpuDraw = 0;
+if (jfaOK && jfaGpuRenderReady) {
+    gpuDraw = 1;
+    /* ---- Stage C: GPU skinning draw. One draw call from the
+     * static jfaGpuVbo; the pose is the same folded matrix set the
+     * CPU path uses (Substage A proved the fold bit-identical). ---- */
+    Uint64 tGpu0 = SDL_GetPerformanceCounter();
+    /* Clear stale GL errors so the post-draw check below is not
+     * misattributed. */
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    jfa_gpu_fold(&jfa, jfaClip, af, jfaScale, jfaCenter, worldPos,
+        jfaBoneStage);
+    glUseProgram(jfaGpuProg);
+    glUniformMatrix4fv(jfaGpuMvpLoc, 1, GL_FALSE, mvp);
+    glUniformMatrix4fv(jfaGpuModelLoc, 1, GL_FALSE, model);
+    glUniform1i(jfaGpuTexLoc, 0);
+    glUniform1f(jfaGpuModeLoc, 0.0f);
+    glUniform4fv(jfaGpuBoneLoc, jfa.nb * 3, jfaBoneStage);
+    glBindBuffer(GL_ARRAY_BUFFER, jfaGpuVbo);
+    glEnableVertexAttribArray(jfaGpuPosLoc);
+    glEnableVertexAttribArray(jfaGpuUvLoc);
+    glEnableVertexAttribArray(jfaGpuNrmLoc);
+    glEnableVertexAttribArray(jfaGpuBoneIdxLoc);
+    glEnableVertexAttribArray(jfaGpuBoneWgtLoc);
+    glVertexAttribPointer(jfaGpuPosLoc, 3, GL_FLOAT, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex),
+        (void*)offsetof(JFAGpuVertex, position));
+    glVertexAttribPointer(jfaGpuUvLoc, 2, GL_FLOAT, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex),
+        (void*)offsetof(JFAGpuVertex, uv));
+    glVertexAttribPointer(jfaGpuNrmLoc, 3, GL_FLOAT, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex),
+        (void*)offsetof(JFAGpuVertex, normal));
+    glVertexAttribPointer(jfaGpuBoneIdxLoc, 4, GL_UNSIGNED_BYTE,
+        GL_FALSE, (GLsizei)sizeof(JFAGpuVertex),
+        (void*)offsetof(JFAGpuVertex, bone));
+    glVertexAttribPointer(jfaGpuBoneWgtLoc, 4, GL_FLOAT, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex),
+        (void*)offsetof(JFAGpuVertex, weight));
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)jfa.nv);
+    /* Attribute enable state is GLOBAL in GLES2: the two extra
+     * bone/weight arrays must not leak into the CPU/FBX/floor
+     * draws. pos/uv/normal are re-pointed by whichever path draws
+     * next, exactly as they already are today. */
+    glDisableVertexAttribArray(jfaGpuBoneIdxLoc);
+    glDisableVertexAttribArray(jfaGpuBoneWgtLoc);
+    glUseProgram(prog); /* restore: FPS text renders with prog */
+    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
+    {
+        GLenum derr = glGetError();
+        if (derr != GL_NO_ERROR) {
+            SDL_Log("JFA GPU render failed (GL error 0x%04x) - CPU path for the rest of the session",
+                derr);
+            jfaGpuRenderReady = 0;
+        }
+    }
+    Uint64 tGpu1 = SDL_GetPerformanceCounter();
+    jfaGpuDrawAcc += (double)(tGpu1 - tGpu0);
+    if (++jfaGpuDrawN == 60) {
+        double ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
+        SDL_Log("PERF jfa gpu draw %.2f ms (fold+uniforms+attribs+draw)",
+            jfaGpuDrawAcc * ms / 60.0);
+        jfaGpuDrawAcc = 0.0;
+        jfaGpuDrawN = 0;
+    }
+    drawCount = (size_t)jfa.nv;
+} else
+#endif
+if (jfaOK) {
+    /* ---- JFA: CPU skin the current clip frame, then one sub-data upload ---- */
     Uint64 tSkin0 = SDL_GetPerformanceCounter();
-    const float worldPos[3] = { 0.0f, 0.0f, 0.0f };
     jfa_skin_frame(&jfa, jfaClip, af, jfaScale, jfaCenter, worldPos,
         &jfaSkin);
     Uint64 tSkin1 = SDL_GetPerformanceCounter();
@@ -583,9 +716,11 @@ if (jfaOK) {
         jfaAccN = 0;
     }
 #ifdef JFA_GPU_SKIN
-    /* Stage A: fold the same pose into the compact vec4 layout and
-     * upload it to the (not yet rendering) GPU program. Exercises
-     * the fold + glUniform4fv path on device for validation. */
+#if !JFA_GPU_RENDER
+    /* Stage A validation mode (RENDER=0): fold the same pose into
+     * the compact vec4 layout and upload it to the (not rendering)
+     * GPU program. In RENDER=1 builds the GPU branch above does
+     * the fold + upload itself. */
     if (jfaGpuOK) {
         Uint64 tFold0 = SDL_GetPerformanceCounter();
         jfa_gpu_fold(&jfa, jfaClip, af, jfaScale, jfaCenter, worldPos,
@@ -601,6 +736,7 @@ if (jfaOK) {
         }
     }
 #endif
+#endif
     drawCount = (size_t)jfa.nv;
 } else {
     glBufferData(
@@ -612,6 +748,10 @@ if (jfaOK) {
     drawCount = frameMesh.vertex_count;
 }
 
+#if JFA_GPU_SKIN && JFA_GPU_RENDER
+if (!gpuDraw)
+#endif
+{
 glEnableVertexAttribArray(pos);
 glEnableVertexAttribArray(uv);
 glEnableVertexAttribArray(normal);
@@ -625,6 +765,7 @@ glVertexAttribPointer(normal, 3, GL_FLOAT, GL_FALSE,
     sizeof(FBXVertex), (void*)offsetof(FBXVertex, normal));
 
 glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
+}
   }
   frames++;Uint64 now=SDL_GetPerformanceCounter();if((double)(now-start)/freq>=.5){fps=(int)(frames*freq/(double)(now-start)+.5);frames=0;start=now;}
   drawFPS(prog,fpsVBO,pos,col,mvpLoc,modeLoc,w,h,fps);SDL_GL_SwapWindow(win);
@@ -652,6 +793,10 @@ if (jfaGpuVbo) {
 }
 free(jfaGpuVerts);
 jfaGpuVerts = NULL;
+if (jfaGpuProg) {
+	glDeleteProgram(jfaGpuProg);
+	jfaGpuProg = 0;
+}
 #endif
 
 fbx_free_mesh(&frameMesh);

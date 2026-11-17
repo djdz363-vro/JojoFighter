@@ -340,6 +340,128 @@ int main(void)
 	free(gv2);
 	free(gv);
 
+	/* 6. Weight-threshold parity: the GPU shader must skip weights
+	 *    w <= 0.00001 exactly like jfa_skin_frame (CPU skips
+	 *    w <= 0.00001), for weights BELOW, EXACTLY AT, and ABOVE
+	 *    the threshold. Synthetic 2-bone character: bone 0 translates
+	 *    +1000 x (big contribution so the skipped/b included
+	 *    difference is far above float noise), bone 1 +100 y. */
+	printf("== 6. weight threshold parity (w > 0.00001) ==\n");
+	{
+		JFACharacter t;
+		JFAClip tc;
+		JFAVertex tv;
+		static float tmat[2][12];
+		JFASkinned tref;
+		const float c0[3] = { 0, 0, 0 }, w0[3] = { 0, 0, 0 };
+		static float tstaged[JFA_GPU_FLOATS];
+		const float thr_cases[3] = { 0.5e-5f, 1e-5f, 2e-5f };
+		const char *thr_names[3] = { "below", "exactly at",
+					     "above" };
+
+		memset(&t, 0, sizeof(t));
+		memset(&tc, 0, sizeof(tc));
+		memset(&tv, 0, sizeof(tv));
+		t.ready = 1;
+		t.nb = 2;
+		t.nv = 1;
+		t.ni = 1;
+		t.v = &tv;
+		memset(tmat, 0, sizeof(tmat));
+		tmat[0][0] = 1; tmat[0][5] = 1; tmat[0][10] = 1;
+		tmat[0][3] = 1000.0f;   /* bone 0: translate +1000 x */
+		tmat[1][0] = 1; tmat[1][5] = 1; tmat[1][10] = 1;
+		tmat[1][7] = 100.0f;    /* bone 1: translate +100 y */
+		tc.frames = 1;
+		tc.fps = 30;
+		tc.mat = &tmat[0][0];
+		t.clips[JFA_IDLE] = tc;
+
+		tv.p[0] = 1; tv.p[1] = 2; tv.p[2] = 3;
+		tv.n[0] = 0; tv.n[1] = 1; tv.n[2] = 0;
+		tv.bi[0] = 0;
+		tv.bi[1] = 1;
+		tv.bi[2] = 0;
+		tv.bi[3] = 0;
+
+		if (!jfa_skin_alloc(&tref, 1)) {
+			printf("  [FAIL] threshold test alloc\n");
+			return 1;
+		}
+
+		for (size_t ci = 0; ci < 3; ci++) {
+			float gx = 0, gy = 0, gz = 0;
+			float ox = 0, oy = 0, oz = 0;
+			const float *F;
+
+			tv.bw[0] = thr_cases[ci];
+			tv.bw[1] = 1.0f - thr_cases[ci];
+			tv.bw[2] = 0.0f;
+			tv.bw[3] = 0.0f;
+
+			jfa_skin_frame(&t, JFA_IDLE, 0, 1.0f, c0, w0,
+				       &tref);
+			jfa_gpu_fold(&t, JFA_IDLE, 0, 1.0f, c0, w0,
+				     tstaged);
+
+			/* GPU shader math, NEW threshold (w > 0.00001). */
+			for (int k = 0; k < 4; k++) {
+				float w = tv.bw[k];
+				if (w <= 0.00001f)
+					continue;
+				F = tstaged + (size_t)tv.bi[k] * 12;
+				gx += w * (F[0] * tv.p[0] + F[1] * tv.p[1] +
+					   F[2] * tv.p[2] + F[3]);
+				gy += w * (F[4] * tv.p[0] + F[5] * tv.p[1] +
+					   F[6] * tv.p[2] + F[7]);
+				gz += w * (F[8] * tv.p[0] + F[9] * tv.p[1] +
+					   F[10] * tv.p[2] + F[11]);
+			}
+			/* OLD math (w > 0) for contrast. */
+			for (int k = 0; k < 4; k++) {
+				float w = tv.bw[k];
+				if (w <= 0.0f)
+					continue;
+				F = tstaged + (size_t)tv.bi[k] * 12;
+				ox += w * (F[0] * tv.p[0] + F[1] * tv.p[1] +
+					   F[2] * tv.p[2] + F[3]);
+				oy += w * (F[4] * tv.p[0] + F[5] * tv.p[1] +
+					   F[6] * tv.p[2] + F[7]);
+				oz += w * (F[8] * tv.p[0] + F[9] * tv.p[1] +
+					   F[10] * tv.p[2] + F[11]);
+			}
+
+			{
+				const double dnew =
+				    fabs(gx - tref.v[0].position[0]) +
+				    fabs(gy - tref.v[0].position[1]) +
+				    fabs(gz - tref.v[0].position[2]);
+				const double dold =
+				    fabs(ox - tref.v[0].position[0]) +
+				    fabs(oy - tref.v[0].position[1]) +
+				    fabs(oz - tref.v[0].position[2]);
+				printf("  w=%.4e (%s): new-vs-CPU %.3g, old-vs-CPU %.3g\n",
+					(double)thr_cases[ci], thr_names[ci],
+					dnew, dold);
+				check(dnew <= 1e-6,
+				      "NEW threshold matches CPU skinning");
+				/* Below/at the threshold the old math
+				 * includes bone 0 (~+1000 x * w): the
+				 * case must actually be
+				 * distinguishable. Above the threshold
+				 * both maths include it -> equal. */
+				if (ci < 2)
+					check(dold > 1e-3,
+					      "OLD math would differ (case is meaningful)");
+				else
+					check(dold <= 1e-6,
+					      "above threshold: old and new agree");
+			}
+		}
+
+		jfa_skin_free(&tref);
+	}
+
 	jfa_skin_free(&ref);
 	jfa_free(&c);
 

@@ -125,6 +125,8 @@ int jfa_gpu_vertices(const JFACharacter *c, JFAGpuVertex *out,
  *   - int(aBoneIndex[k]) is exact: indices arrive as exact integer
  *     floats 0..32 (they are validated/clamped < nb before upload).
  *   - the loop bound is a constant (4), as required for ES 2.0.
+ *   - the weight threshold (w > 0.00001) matches the CPU skinning
+ *     skip (jfa_skin_frame skips w <= 0.00001) for exact parity.
  */
 extern const char *jfa_gpu_vs;
 

@@ -1,5 +1,30 @@
 def buildAsLibrary = project.hasProperty('BUILD_AS_LIBRARY');
 def buildAsApplication = !buildAsLibrary
+
+// ---- JFA GPU A/B build switches (M2 Stage C) ----
+//   ./gradlew assembleDebug                          -> CPU-only (permanent default)
+//   ./gradlew assembleDebug -PJFA_GPU_SKIN=1         -> GPU prep active, CPU renders
+//   ./gradlew assembleDebug -PJFA_GPU_SKIN=1 -PJFA_GPU_RENDER=1 -> GPU renders
+// The values are forwarded to ndk-build and mapped to compiler
+// definitions in jni/Application.mk. Both default to "0".
+def jfaGpuSkin   = (project.findProperty('JFA_GPU_SKIN')   ?: '0').toString()
+def jfaGpuRender = (project.findProperty('JFA_GPU_RENDER') ?: '0').toString()
+if ((jfaGpuSkin != '0' && jfaGpuSkin != '1') ||
+    (jfaGpuRender != '0' && jfaGpuRender != '1')) {
+    throw new GradleException(
+        "Invalid JFA_GPU_SKIN/JFA_GPU_RENDER: expected 0 or 1, " +
+        "got JFA_GPU_SKIN=${jfaGpuSkin} JFA_GPU_RENDER=${jfaGpuRender}")
+}
+if (jfaGpuRender == '1' && jfaGpuSkin != '1') {
+    throw new GradleException(
+        "JFA_GPU_RENDER=1 requires JFA_GPU_SKIN=1 " +
+        "(got JFA_GPU_SKIN=${jfaGpuSkin})")
+}
+// Output tag: 'cpu' (default, keeps the CI's app-debug.apk name and
+// path), 'gpuSkin', or 'gpuRender'.
+def jfaGpuTag = (jfaGpuSkin == '1') ?
+    (jfaGpuRender == '1' ? 'gpuRender' : 'gpuSkin') : 'cpu'
+
 if (buildAsApplication) {
     apply plugin: 'com.android.application'
 }
@@ -19,7 +44,9 @@ android {
         versionName "1.0"
         externalNativeBuild {
             ndkBuild {
-                arguments "APP_PLATFORM=android-21"
+                arguments "APP_PLATFORM=android-21",
+                          "JFA_GPU_SKIN=${jfaGpuSkin}",
+                          "JFA_GPU_RENDER=${jfaGpuRender}"
                 abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
             }
             // cmake {
@@ -38,6 +65,17 @@ android {
     applicationVariants.all { variant ->
         tasks["merge${variant.name.capitalize()}Assets"]
             .dependsOn("externalNativeBuild${variant.name.capitalize()}")
+    }
+    // APK naming (AGP 8.6: outputFileName assignment). Only the GPU
+    // A/B builds are renamed; the default 'cpu' build keeps the
+    // untouched app-debug.apk path that the CI workflow uploads.
+    if (buildAsApplication && jfaGpuTag != 'cpu') {
+        applicationVariants.all { variant ->
+            variant.outputs.all { output ->
+                outputFileName =
+                    "JoJo-Fighter-${jfaGpuTag}-${variant.buildType.name}.apk"
+            }
+        }
     }
     if (!project.hasProperty('EXCLUDE_NATIVE_LIBS')) {
         sourceSets.main {

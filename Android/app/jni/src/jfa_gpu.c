@@ -124,7 +124,7 @@ const char *jfa_gpu_vs =
 " vec4 p4=vec4(aPosition,1.0);"
 " for(int k=0;k<4;k++){"
 "  float w=aBoneWeight[k];"
-"  if(w>0.0){"
+"  if(w>0.00001){"
 "   int b=int(aBoneIndex[k]);"
 "   vec4 r0=uBones[b*3+0];"
 "   vec4 r1=uBones[b*3+1];"
