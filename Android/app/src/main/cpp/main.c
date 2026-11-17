@@ -79,39 +79,49 @@ enum {
 #define JFA_DPAD_NX 0.18f
 #define JFA_DPAD_NY 0.78f
 #define JFA_DPAD_MIN_PX 64.0f
-#define JFA_DPAD_MAX_PX 132.0f
+#define JFA_DPAD_MAX_PX 120.0f
 #define JFA_DPAD_EDGE_PX 8.0f
+#define JFA_DPAD_SPACING 1.22f
 
-/* Button size and spacing scale with the smaller viewport dimension;
- * the cluster is clamped so all four buttons stay fully on-screen in
- * both portrait and landscape, including small displays. */
-static void jfa_dpad_metrics(int vw, int vh, float *size, float *gap,
-                             float *cx, float *cy)
+/* One shared geometry, expressed in normalized WINDOW coordinates and
+ * used for BOTH touch hit-testing and overlay drawing. Because sizes
+ * are converted to normalized halves per axis, buttons stay square in
+ * pixels and hitboxes always match what is drawn -- even when the
+ * OpenGL drawable size differs from the SDL window size. */
+typedef struct {
+    float cx, cy;   /* normalized cluster center */
+    float hx, hy;   /* normalized button half-size */
+    float gx, gy;   /* normalized center-to-center spacing */
+} JFADpadGeom;
+
+static void jfa_dpad_geom(int vw, int vh, JFADpadGeom *g)
 {
-    float minDim = (vw > 0 && vh > 0) ?
-        (float)(vw < vh ? vw : vh) : 480.0f;
-    float s = minDim * 0.20f;
-    float g, half, lo, hi, v;
+    int minDim;
+    float s, gapPx, lo, hi, v, margin;
 
+    if (vw < 1 || vh < 1) { vw = 1080; vh = 1920; }
+    minDim = (vw < vh) ? vw : vh;
+    s = (float)minDim * 0.17f;
     if (s < JFA_DPAD_MIN_PX) s = JFA_DPAD_MIN_PX;
     if (s > JFA_DPAD_MAX_PX) s = JFA_DPAD_MAX_PX;
-    g = s * 1.06f;
-    half = s * 0.5f;
+    gapPx = s * JFA_DPAD_SPACING;
 
-    lo = g + half + JFA_DPAD_EDGE_PX;
-    hi = (float)vw - lo;
-    v = JFA_DPAD_NX * (float)vw;
-    *cx = (lo > hi) ? (float)vw * 0.5f :
-          (v < lo ? lo : (v > hi ? hi : v));
+    g->hx = s * 0.5f / (float)vw;
+    g->hy = s * 0.5f / (float)vh;
+    g->gx = gapPx / (float)vw;
+    g->gy = gapPx / (float)vh;
 
-    lo = g + half + JFA_DPAD_EDGE_PX;
-    hi = (float)vh - lo;
-    v = JFA_DPAD_NY * (float)vh;
-    *cy = (lo > hi) ? (float)vh * 0.5f :
-          (v < lo ? lo : (v > hi ? hi : v));
+    margin = JFA_DPAD_EDGE_PX / (float)vw;
+    lo = g->gx + g->hx + margin;
+    hi = 1.0f - lo;
+    v = JFA_DPAD_NX;
+    g->cx = (lo > hi) ? 0.5f : (v < lo ? lo : (v > hi ? hi : v));
 
-    *size = s;
-    *gap = g;
+    margin = JFA_DPAD_EDGE_PX / (float)vh;
+    lo = g->gy + g->hy + margin;
+    hi = 1.0f - lo;
+    v = JFA_DPAD_NY;
+    g->cy = (lo > hi) ? 0.5f : (v < lo ? lo : (v > hi ? hi : v));
 }
 
 typedef struct {
@@ -135,23 +145,18 @@ static void jfa_dpad_reset(JFADpad *d)
 /* Returns the button bit under a normalized touch, or 0 (no button). */
 static int jfa_dpad_hit(float nx, float ny, int vw, int vh)
 {
-    float size, gap, cx, cy;
-    const float px = nx * (float)vw;
-    const float py = ny * (float)vh;
-    float hs;
-    float off[4][2];
-
-    jfa_dpad_metrics(vw, vh, &size, &gap, &cx, &cy);
-    hs = size * 0.5f;
-    off[0][0] = 0.0f;  off[0][1] = -gap;
-    off[1][0] = 0.0f;  off[1][1] =  gap;
-    off[2][0] = -gap;  off[2][1] = 0.0f;
-    off[3][0] =  gap;  off[3][1] = 0.0f;
+    JFADpadGeom g;
     const int bits[4] = { JFA_DIR_UP, JFA_DIR_DOWN,
                           JFA_DIR_LEFT, JFA_DIR_RIGHT };
+    const float off[4][2] = {
+        { 0.0f, -1.0f }, { 0.0f, 1.0f },
+        { -1.0f, 0.0f }, { 1.0f, 0.0f }
+    };
+    jfa_dpad_geom(vw, vh, &g);
     for (int i = 0; i < 4; i++) {
-        if (fabsf(px - (cx + off[i][0])) <= hs &&
-            fabsf(py - (cy + off[i][1])) <= hs)
+        float bx = g.cx + off[i][0] * g.gx;
+        float by = g.cy + off[i][1] * g.gy;
+        if (fabsf(nx - bx) <= g.hx && fabsf(ny - by) <= g.hy)
             return bits[i];
     }
     return 0;
@@ -171,11 +176,21 @@ static void jfa_dpad_down(JFADpad *d, SDL_FingerID id,
 static void jfa_dpad_motion(JFADpad *d, SDL_FingerID id,
                             float nx, float ny, int vw, int vh)
 {
+    int dest = jfa_dpad_hit(nx, ny, vw, vh);
     for (int i = 0; i < 4; i++) {
-        /* Sliding off a button releases ONLY that button's direction. */
-        if (d->finger[i] == id &&
-            jfa_dpad_hit(nx, ny, vw, vh) != (1 << i))
-            d->finger[i] = -1;
+        if (d->finger[i] != id)
+            continue;
+        if (dest == (1 << i))
+            return; /* still on the same button */
+        d->finger[i] = -1; /* release the old direction */
+        /* Transfer ownership if the new button is free; never steal
+         * a button already held by another finger. */
+        if (dest) {
+            int j = jfa_dpad_index(dest);
+            if (d->finger[j] < 0)
+                d->finger[j] = id;
+        }
+        return;
     }
 }
 
@@ -207,9 +222,7 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
 {
     float v[1024];
     int n = 0, ntri;
-    float size, gap, cx, cy;
-    jfa_dpad_metrics(w, h, &size, &gap, &cx, &cy);
-    const float hs = size * 0.5f;
+    JFADpadGeom gg;
     const float dirs[4][2] = {
         { 0.0f, -1.0f }, { 0.0f, 1.0f },
         { -1.0f, 0.0f }, { 1.0f, 0.0f }
@@ -217,17 +230,21 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
     const int bits[4] = {
         JFA_DIR_UP, JFA_DIR_DOWN, JFA_DIR_LEFT, JFA_DIR_RIGHT
     };
+    /* Geometry comes from WINDOW coordinates (same as hit testing);
+     * identity clip space maps directly onto the GL viewport, so
+     * drawable-vs-window scaling cannot shift the buttons. */
+    jfa_dpad_geom(w, h, &gg);
 
-#define DPV(px, py, r, g, b) do { \
-    v[n++] = 2.0f * (px) / (float)w - 1.0f; \
-    v[n++] = 1.0f - 2.0f * (py) / (float)h; \
+#define DPV(nx, ny, r, g, b) do { \
+    v[n++] = 2.0f * (nx) - 1.0f; \
+    v[n++] = 1.0f - 2.0f * (ny); \
     v[n++] = 0.0f; v[n++] = r; v[n++] = g; v[n++] = b; \
 } while (0)
 
     /* Triangle pass: subtle button backgrounds + direction arrows. */
     for (int i = 0; i < 4; i++) {
-        const float bx = cx + dirs[i][0] * gap;
-        const float by = cy + dirs[i][1] * gap;
+        const float bx = gg.cx + dirs[i][0] * gg.gx;
+        const float by = gg.cy + dirs[i][1] * gg.gy;
         const int pressed = (mask & (unsigned)bits[i]) != 0;
         const float br = pressed ? 0.40f : 0.20f;
         const float bg = pressed ? 0.40f : 0.21f;
@@ -235,44 +252,46 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
         const float ar = pressed ? 1.0f : 0.78f;
         const float ag = pressed ? 0.90f : 0.78f;
         const float ab = pressed ? 0.50f : 0.78f;
-        DPV(bx - hs, by - hs, br, bg, bb);
-        DPV(bx + hs, by - hs, br, bg, bb);
-        DPV(bx + hs, by + hs, br, bg, bb);
-        DPV(bx - hs, by - hs, br, bg, bb);
-        DPV(bx + hs, by + hs, br, bg, bb);
-        DPV(bx - hs, by + hs, br, bg, bb);
+        DPV(bx - gg.hx, by - gg.hy, br, bg, bb);
+        DPV(bx + gg.hx, by - gg.hy, br, bg, bb);
+        DPV(bx + gg.hx, by + gg.hy, br, bg, bb);
+        DPV(bx - gg.hx, by - gg.hy, br, bg, bb);
+        DPV(bx + gg.hx, by + gg.hy, br, bg, bb);
+        DPV(bx - gg.hx, by + gg.hy, br, bg, bb);
         /* Arrow points away from the D-pad center. */
         const float ax = dirs[i][0], ay = dirs[i][1];
         const float sx = -ay, sy = ax;
-        DPV(bx + ax * hs * 0.48f, by + ay * hs * 0.48f, ar, ag, ab);
-        DPV(bx - ax * hs * 0.28f + sx * hs * 0.32f,
-            by - ay * hs * 0.28f + sy * hs * 0.32f, ar, ag, ab);
-        DPV(bx - ax * hs * 0.28f - sx * hs * 0.32f,
-            by - ay * hs * 0.28f - sy * hs * 0.32f, ar, ag, ab);
+        DPV(bx + ax * gg.hx * 0.48f, by + ay * gg.hy * 0.48f,
+            ar, ag, ab);
+        DPV(bx - ax * gg.hx * 0.28f + sx * gg.hx * 0.32f,
+            by - ay * gg.hy * 0.28f + sy * gg.hy * 0.32f, ar, ag, ab);
+        DPV(bx - ax * gg.hx * 0.28f - sx * gg.hx * 0.32f,
+            by - ay * gg.hy * 0.28f - sy * gg.hy * 0.32f, ar, ag, ab);
     }
     ntri = n;
 
     /* Line pass: pentagon outlines, tip pointing toward center. */
     for (int i = 0; i < 4; i++) {
-        const float bx = cx + dirs[i][0] * gap;
-        const float by = cy + dirs[i][1] * gap;
+        const float bx = gg.cx + dirs[i][0] * gg.gx;
+        const float by = gg.cy + dirs[i][1] * gg.gy;
         const int pressed = (mask & (unsigned)bits[i]) != 0;
         const float r = pressed ? 1.0f : 0.82f;
         const float g = pressed ? 0.90f : 0.82f;
         const float b = pressed ? 0.50f : 0.82f;
         /* local +y axis points toward the D-pad center */
-        const float ay = -dirs[i][1], ax2 = -dirs[i][0];
-        const float ux = -ay, uy = ax2; /* local +x perpendicular */
+        const float ay2 = -dirs[i][1], ax2 = -dirs[i][0];
+        const float ux = -ay2, uy = ax2; /* local +x perpendicular */
         const float lp[5][2] = {
-            { -hs, -hs }, { hs, -hs }, { hs, hs * 0.2f },
-            { 0.0f, hs }, { -hs, hs * 0.2f }
+            { -gg.hx, -gg.hy }, { gg.hx, -gg.hy },
+            { gg.hx, gg.hy * 0.2f }, { 0.0f, gg.hy },
+            { -gg.hx, gg.hy * 0.2f }
         };
         float p[5][2];
         for (int k = 0; k < 5; k++)
             for (int q = 0; q < 2; q++)
                 p[k][q] = (q == 0) ?
                     (bx + lp[k][0] * ux + lp[k][1] * ax2) :
-                    (by + lp[k][0] * uy + lp[k][1] * ay);
+                    (by + lp[k][0] * uy + lp[k][1] * ay2);
         for (int k = 0; k < 5; k++) {
             int t = (k + 1) % 5;
             DPV(p[k][0], p[k][1], r, g, b);
@@ -307,8 +326,9 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
 /* ---- M3.1-A: one movement step (pure math, desktop-testable).
  * pos[0]/pos[1] are X/Z; Y is never touched (character stays grounded).
  * dt is clamped here so a long pause cannot teleport through a wall. */
-static void jfa_move_step(float pos[2], float *facing,
-                          float dx, float dz, double dt, float limit)
+static void jfa_move_step(float pos[2], float *facing, float dx, float dz,
+                          double dt, float xLimit, float zBack,
+                          float zFront)
 {
  const float speed = 3.0f; /* world units per second */
  float len;
@@ -323,10 +343,10 @@ static void jfa_move_step(float pos[2], float *facing,
      pos[0] += dx * speed * (float)dt;
      pos[1] += dz * speed * (float)dt;
  }
- if (pos[0] < -limit) pos[0] = -limit;
- if (pos[0] >  limit) pos[0] =  limit;
- if (pos[1] < -limit) pos[1] = -limit;
- if (pos[1] >  limit) pos[1] =  limit;
+ if (pos[0] < -xLimit) pos[0] = -xLimit;
+ if (pos[0] >  xLimit) pos[0] =  xLimit;
+ if (pos[1] < zBack)   pos[1] = zBack;
+ if (pos[1] > zFront)  pos[1] = zFront;
 }
 static int push(Mesh *m,Vertex v){
  if(m->count==m->cap){size_t n=m->cap?m->cap*2:4096;Vertex *p=(Vertex*)realloc(m->v,n*sizeof(Vertex));if(!p)return 0;m->v=p;m->cap=n;}m->v[m->count++]=v;return 1;
@@ -849,12 +869,22 @@ double freq = (double)SDL_GetPerformanceFrequency();
         (double)(counter - moveLastCounter) / freq : 0.0;
     moveLastCounter = counter;
     moveTimeValid = 1;
-    /* Wall inner face is at (arena half - wall thickness); keep a
-     * body radius margin so the character cannot clip walls or
-     * escape through corners. Y is intentionally untouched (0). */
+    /* X: wall inner face (arena half - wall thickness) minus a body
+     * radius. Y is untouched (grounded).
+     * Z is ASYMMETRIC: the camera sits at world z=0 and sceneTrans
+     * places the character at world z = charZ - 3.5. Keep at least
+     * 1.15 body heights in front of the camera (near plane 0.2)
+     * and no farther than 3 body heights away (still legible),
+     * while never passing the arena's back wall. */
     const float arenaHalf = 4.2f;
     const float wallThickness = characterHeight * 0.08f;
-    const float limit = arenaHalf - wallThickness - 0.35f;
+    const float bodyRadius = 0.35f;
+    const float xLimit = arenaHalf - wallThickness - bodyRadius;
+    const float sceneDist = 3.5f; /* |sceneTrans[14]| */
+    const float frontZ = sceneDist - characterHeight * 1.15f;
+    float backZ = sceneDist - characterHeight * 3.0f;
+    if (backZ < -xLimit) backZ = -xLimit;
+    if (backZ > frontZ - 0.5f) backZ = frontZ - 0.5f;
     /* Digital D-pad contributes to the same direction vector as the
      * keyboard; jfa_move_step normalizes diagonals and clamps dt. */
     const unsigned dmask = jfa_dpad_mask(&dpad);
@@ -862,7 +892,8 @@ double freq = (double)SDL_GetPerformanceFrequency();
     if (dmask & JFA_DIR_DOWN)  dz += 1.0f;
     if (dmask & JFA_DIR_LEFT)  dx -= 1.0f;
     if (dmask & JFA_DIR_RIGHT) dx += 1.0f;
-    jfa_move_step(charPos, &charFacing, dx, dz, dt, limit);
+    jfa_move_step(charPos, &charFacing, dx, dz, dt,
+                  xLimit, backZ, frontZ);
   }
 
 if (!jfaOK) {
@@ -1115,8 +1146,8 @@ glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
   }
   frames++;Uint64 now=SDL_GetPerformanceCounter();if((double)(now-start)/freq>=.5){fps=(int)(frames*freq/(double)(now-start)+.5);frames=0;start=now;}
   drawFPS(prog,fpsVBO,pos,col,mvpLoc,modeLoc,w,h,fps);
-  jfa_dpad_draw(prog, dpadVBO, pos, col, mvpLoc, modeLoc, w, h,
-                jfa_dpad_mask(&dpad)); /* overlay only; character path untouched */
+  jfa_dpad_draw(prog, dpadVBO, pos, col, mvpLoc, modeLoc,
+                inputW, inputH, jfa_dpad_mask(&dpad)); /* overlay only; character path untouched */
   SDL_GL_SwapWindow(win);
  }
  glDeleteBuffers(1, &meshVBO);
