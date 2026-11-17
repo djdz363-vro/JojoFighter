@@ -32,9 +32,9 @@
 
 /*
  * Skeleton size the GPU shader is compiled for. The shader declares
- * `uniform vec4 uBones[33]` (3 vec4 per bone). With the 8 vectors the
- * existing vertex stage already consumes (uMVP + uModel), the link
- * requirement is 8 + 3*33 = 107 <= GL_MAX_VERTEX_UNIFORM_VECTORS
+ * `uniform vec4 uBones[99]` (3 vec4 per bone x 33 bones). With the 8
+ * vectors the existing vertex stage already consumes (uMVP + uModel),
+ * the link requirement is 8 + 99 = 107 <= GL_MAX_VERTEX_UNIFORM_VECTORS
  * (spec minimum is 128; Mali-400 reports exactly 128). Skeletons with
  * more bones fail the budget check and stay on the CPU path.
  */

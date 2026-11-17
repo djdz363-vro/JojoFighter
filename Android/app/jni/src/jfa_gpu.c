@@ -117,7 +117,10 @@ const char *jfa_gpu_vs =
 "attribute vec3 aPosition; attribute vec2 aUV; attribute vec3 aNormal;"
 "attribute vec4 aBoneIndex; attribute vec4 aBoneWeight;"
 "uniform mat4 uMVP; uniform mat4 uModel;"
-"uniform vec4 uBones[" /* JFA_GPU_MAX_BONES */ "33];"
+/* 3 vec4 per bone x 33 bones = 99 vec4. The shader indexes
+ * uBones[b*3 + r], so the array MUST have JFA_GPU_BONE_VECS
+ * elements (99), not one element per bone (33). */
+"uniform vec4 uBones[" /* JFA_GPU_BONE_VECS */ "99];"
 "varying vec2 vUV; varying float vLight; varying vec3 vColor;"
 "void main(){"
 " vec3 sp=vec3(0.0); vec3 sn=vec3(0.0);"
