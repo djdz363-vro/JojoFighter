@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include "fbx_loader.h"
 #include "jfa_skin.h"
+#include "jfa_gpu.h"
 
 /* ------------------------------------------------------------------ */
 /* JFA character state (Stage B). Loaded once; all per-frame work      */
@@ -353,6 +354,52 @@ if (!jfaOK && fbxOK && frameMesh.vertex_count > 0) {
 }
  GLint pos=glGetAttribLocation(prog,"aPosition"),uv=glGetAttribLocation(prog,"aUV"),normal=glGetAttribLocation(prog,"aNormal"),col=glGetAttribLocation(prog,"aColor");
  GLint mvpLoc=glGetUniformLocation(prog,"uMVP"),modelLoc=glGetUniformLocation(prog,"uModel"),texLoc=glGetUniformLocation(prog,"uTexture"),modeLoc=glGetUniformLocation(prog,"uTextMode");
+
+#ifdef JFA_GPU_SKIN
+/* ---- Stage C Substage A: GPU skinning infrastructure. Compiled in
+ * ONLY with -DJFA_GPU_SKIN (temporary A/B switch); without it this
+ * build is byte-for-byte the CPU behavior. Stage A creates the
+ * program, checks the vertex-uniform budget at runtime, and uploads
+ * the folded 3x4 matrices as 99 vec4 each frame. Vertex attributes
+ * and rendering switch come in Stage B -- the CPU path still
+ * renders everything below. ---- */
+GLuint jfaGpuProg = 0;
+GLint jfaGpuBoneLoc = -1;
+int jfaGpuOK = 0;
+static int jfaGpuAccN = 0;
+static float jfaBoneStage[JFA_GPU_BONE_VECS * 4]; /* 99 vec4 staging */
+{
+	GLint maxVUV = 0;
+	glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &maxVUV);
+	if (!jfaOK) {
+		SDL_Log("JFA GPU skin: skipped (no JFA data)");
+	} else if (!jfa_gpu_budget_ok(maxVUV, jfa.nb)) {
+		SDL_Log("JFA GPU skin: budget fails (maxVUV=%d, bones=%d, need %d) - CPU path",
+			maxVUV, jfa.nb, JFA_GPU_BASE_VECS + JFA_GPU_BONE_VECS);
+	} else {
+		GLuint va=shader(GL_VERTEX_SHADER,jfa_gpu_vs),vb=shader(GL_FRAGMENT_SHADER,fs);
+		if (va && vb) {
+			jfaGpuProg=glCreateProgram();glAttachShader(jfaGpuProg,va);glAttachShader(jfaGpuProg,vb);
+			glLinkProgram(jfaGpuProg);GLint ok=0;glGetProgramiv(jfaGpuProg,GL_LINK_STATUS,&ok);
+			if(!ok){char log[512];glGetProgramInfoLog(jfaGpuProg,sizeof(log),NULL,log);SDL_Log("JFA GPU link: %s",log);glDeleteProgram(jfaGpuProg);jfaGpuProg=0;}
+		} else {
+			SDL_Log("JFA GPU shader compile failed");
+		}
+		glDeleteShader(va);glDeleteShader(vb);
+		if (jfaGpuProg) {
+			jfaGpuBoneLoc=glGetUniformLocation(jfaGpuProg,"uBones");
+			if (jfaGpuBoneLoc >= 0) {
+				jfaGpuOK = 1;
+				SDL_Log("JFA GPU program ready: maxVUV=%d, bones=%d, uBones=%d vec4 (Stage A: matrices only, CPU path renders)",
+					maxVUV, jfa.nb, jfa.nb * 3);
+			} else {
+				SDL_Log("JFA GPU: uBones location not found - CPU path");
+				glDeleteProgram(jfaGpuProg);jfaGpuProg=0;
+			}
+		}
+	}
+}
+#endif
  glEnable(GL_DEPTH_TEST);
 glDepthFunc(GL_LEQUAL);
 
@@ -481,6 +528,25 @@ if (jfaOK) {
         jfaAccSkin = jfaAccUpload = jfaAccDraw = 0.0;
         jfaAccN = 0;
     }
+#ifdef JFA_GPU_SKIN
+    /* Stage A: fold the same pose into the compact vec4 layout and
+     * upload it to the (not yet rendering) GPU program. Exercises
+     * the fold + glUniform4fv path on device for validation. */
+    if (jfaGpuOK) {
+        Uint64 tFold0 = SDL_GetPerformanceCounter();
+        jfa_gpu_fold(&jfa, jfaClip, af, jfaScale, jfaCenter, worldPos,
+            jfaBoneStage);
+        glUseProgram(jfaGpuProg);
+        glUniform4fv(jfaGpuBoneLoc, jfa.nb * 3, jfaBoneStage);
+        glUseProgram(prog);
+        if (++jfaGpuAccN == 60) {
+            double ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
+            SDL_Log("PERF jfa gpu fold+upload %.2f ms (Stage A, CPU path renders)",
+                (double)(SDL_GetPerformanceCounter() - tFold0) * ms / 60.0);
+            jfaGpuAccN = 0;
+        }
+    }
+#endif
     drawCount = (size_t)jfa.nv;
 } else {
     glBufferData(
