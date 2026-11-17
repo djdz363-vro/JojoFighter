@@ -71,7 +71,9 @@ void jfa_gpu_fold(const JFACharacter *c, int clip_index, int frame,
  * GPU vertex format (Substage B): the static bind-pose mesh converted
  * for the GPU skinning vertex shader. 52 bytes per vertex:
  *   offset  0: position 3 x float   (bind pose)
- *   offset 12: uv      2 x float    (raw file UV, unmodified)
+ *   offset 12: uv      2 x float    (U as-is, V flipped for GLES,
+ *                                    matching the CPU renderer's init
+ *                                    prefill "1 - v")
  *   offset 20: normal   3 x float   (bind pose)
  *   offset 32: bone     4 x uint8   (validated, clamped to bone 0
  *                                    for zero-weight slots)
@@ -104,7 +106,8 @@ typedef struct {
  *   - all four weights finite and within [0,1], summing to 1 within
  *     1e-4 (the loader's normalization contract).
  *
- * Positions, UVs, normals and weights are copied bit-exactly.
+ * Positions, normals and weights are copied bit-exactly; U is copied
+ * bit-exactly and V is flipped (1 - v) to match the CPU renderer.
  */
 int jfa_gpu_vertices(const JFACharacter *c, JFAGpuVertex *out,
 		     size_t out_cap);

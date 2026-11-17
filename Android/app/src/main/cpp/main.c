@@ -368,6 +368,11 @@ GLint jfaGpuBoneLoc = -1;
 int jfaGpuOK = 0;
 static int jfaGpuAccN = 0;
 static float jfaBoneStage[JFA_GPU_BONE_VECS * 4]; /* 99 vec4 staging */
+/* Substage B: prepared static GPU vertex data. jfaGpuVerts stays NULL
+ * on ANY preparation failure - that only disables the (not yet used)
+ * GPU draw path later; the CPU renderer keeps rendering regardless. */
+static JFAGpuVertex *jfaGpuVerts = NULL;
+static GLuint jfaGpuVbo = 0;
 {
 	GLint maxVUV = 0;
 	glGetIntegerv(GL_MAX_VERTEX_UNIFORM_VECTORS, &maxVUV);
@@ -395,6 +400,55 @@ static float jfaBoneStage[JFA_GPU_BONE_VECS * 4]; /* 99 vec4 staging */
 			} else {
 				SDL_Log("JFA GPU: uBones location not found - CPU path");
 				glDeleteProgram(jfaGpuProg);jfaGpuProg=0;
+			}
+		}
+	}
+}
+/* ---- Stage C Substage B: prepare the static GPU vertex data once.
+ * Runs during init, AFTER the Stage A program was created and only if
+ * jfaGpuOK (GPU budget + program ready). One allocation, one
+ * validated conversion, one upload into a dedicated GL_STATIC_DRAW
+ * VBO. Every failure path logs, cleans up after itself and leaves the
+ * CPU renderer untouched - jfaGpuVerts/jfaGpuVbo are only consumed by
+ * a future draw substage, never bound for drawing here. ---- */
+if (jfaGpuOK && jfaOK && jfa.nv > 0) {
+	const size_t gnv = (size_t)jfa.nv;
+	jfaGpuVerts = malloc(gnv * sizeof(JFAGpuVertex));
+	if (!jfaGpuVerts) {
+		SDL_Log("JFA GPU verts: alloc failed (%zu x %d bytes) - CPU path unaffected",
+			gnv, (int)sizeof(JFAGpuVertex));
+	} else if (!jfa_gpu_vertices(&jfa, jfaGpuVerts, gnv)) {
+		SDL_Log("JFA GPU verts: conversion rejected input - CPU path unaffected");
+		free(jfaGpuVerts);
+		jfaGpuVerts = NULL;
+	} else {
+		glGenBuffers(1, &jfaGpuVbo);
+		if (jfaGpuVbo == 0) {
+			SDL_Log("JFA GPU verts: glGenBuffers returned 0 - preparation failed, CPU path unaffected");
+			free(jfaGpuVerts);
+			jfaGpuVerts = NULL;
+		} else {
+			/* Clear any pre-existing GL error so it is not
+			 * misattributed to the upload below. */
+			while (glGetError() != GL_NO_ERROR) {
+			}
+			glBindBuffer(GL_ARRAY_BUFFER, jfaGpuVbo);
+			glBufferData(GL_ARRAY_BUFFER,
+				gnv * sizeof(JFAGpuVertex), jfaGpuVerts,
+				GL_STATIC_DRAW);
+			const GLenum gerr = glGetError();
+			if (gerr != GL_NO_ERROR) {
+				SDL_Log("JFA GPU verts: upload failed (GL error 0x%04x) - preparation failed, CPU path unaffected",
+					gerr);
+				glBindBuffer(GL_ARRAY_BUFFER, 0);
+				glDeleteBuffers(1, &jfaGpuVbo);
+				jfaGpuVbo = 0;
+				free(jfaGpuVerts);
+				jfaGpuVerts = NULL;
+			} else {
+				glBindBuffer(GL_ARRAY_BUFFER, 0);
+				SDL_Log("JFA GPU verts ready: %d verts, %d bytes each (Stage B: preparation only, no draw)",
+					jfa.nv, (int)sizeof(JFAGpuVertex));
 			}
 		}
 	}
@@ -588,6 +642,17 @@ if (jfaOK) {
     jfa_skin_free(&jfaSkin);
     jfa_free(&jfa);
 }
+
+#ifdef JFA_GPU_SKIN
+/* Stage B cleanup: the GPU VBO and the prepared vertex array are
+ * owned independently of the CPU renderer state. */
+if (jfaGpuVbo) {
+	glDeleteBuffers(1, &jfaGpuVbo);
+	jfaGpuVbo = 0;
+}
+free(jfaGpuVerts);
+jfaGpuVerts = NULL;
+#endif
 
 fbx_free_mesh(&frameMesh);
 fbx_free(&fbx);

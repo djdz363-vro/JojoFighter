@@ -49,7 +49,10 @@ int jfa_gpu_vertices(const JFACharacter *c, JFAGpuVertex *out,
 		}
 
 		memcpy(d->position, s->p, sizeof(d->position));
-		memcpy(d->uv, s->uv, sizeof(d->uv));
+		/* V flipped for GLES, exactly like the CPU renderer's init
+		 * prefill (jfaSkin.v[i].uv[1] = 1 - uv[1]); U copied as-is. */
+		d->uv[0] = s->uv[0];
+		d->uv[1] = 1.0f - s->uv[1];
 		memcpy(d->normal, s->n, sizeof(d->normal));
 	}
 	return 1;

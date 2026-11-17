@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <math.h>
 
 static int failures = 0;
@@ -194,6 +195,150 @@ int main(void)
 	jfa_gpu_fold(&c, -1, 0, scale, center, world, staged); /* must not crash */
 	jfa_gpu_fold(&c, JFA_CLIP_COUNT, 0, scale, center, world, staged);
 	check(1, "degenerate clip indices do not crash");
+
+	/* 5. GPU vertex preparation (Substage B): layout, conversion,
+	 *    weight preservation, zero-weight pinning, malformed input. */
+	printf("== 5. GPU vertex preparation (jfa_gpu_vertices) ==\n");
+	check(sizeof(JFAGpuVertex) == 52, "sizeof(JFAGpuVertex) == 52 bytes");
+	check(offsetof(JFAGpuVertex, position) == 0, "aPosition offset 0");
+	check(offsetof(JFAGpuVertex, uv) == 12, "aUV offset 12");
+	check(offsetof(JFAGpuVertex, normal) == 20, "aNormal offset 20");
+	check(offsetof(JFAGpuVertex, bone) == 32, "aBoneIndex offset 32");
+	check(offsetof(JFAGpuVertex, weight) == 36, "aBoneWeight offset 36");
+
+	JFAGpuVertex *gv = malloc((size_t)c.nv * sizeof(JFAGpuVertex));
+	if (!gv) {
+		printf("  [FAIL] GPU vertex alloc\n");
+		jfa_skin_free(&ref);
+		jfa_free(&c);
+		return 1;
+	}
+	check(jfa_gpu_vertices(&c, gv, (size_t)c.nv) == 1,
+	      "converts all real vertices");
+	check(jfa_gpu_vertices(&c, gv, (size_t)c.nv - 1) == 0,
+	      "out_cap < nv rejected");
+	check(jfa_gpu_vertices(&c, gv, 0) == 0, "out_cap 0 rejected");
+	check(jfa_gpu_vertices(&c, NULL, (size_t)c.nv) == 0,
+	      "NULL output rejected");
+
+	/* Full-coverage comparison of the converted mesh against the
+	 * shared bind-pose source. */
+	size_t zero_slots = 0;
+	int pos_exact = 1, uv_ok = 1, w_exact = 1, bone_ok = 1, pin_ok = 1;
+	for (size_t i = 0; i < (size_t)c.nv; i++) {
+		const JFAVertex *s = &c.v[i];
+		const JFAGpuVertex *d = &gv[i];
+
+		if (memcmp(d->position, s->p, sizeof(d->position)) != 0 ||
+		    memcmp(d->normal, s->n, sizeof(d->normal)) != 0)
+			pos_exact = 0;
+		if (d->uv[0] != s->uv[0] ||
+		    d->uv[1] != 1.0f - s->uv[1])
+			uv_ok = 0;
+		if (memcmp(d->weight, s->bw, sizeof(d->weight)) != 0)
+			w_exact = 0;
+		for (int k = 0; k < 4; k++) {
+			if (s->bw[k] > 0.0f) {
+				if (d->bone[k] != (uint8_t)s->bi[k])
+					bone_ok = 0;
+			} else {
+				zero_slots++;
+				if (d->bone[k] != 0)
+					pin_ok = 0;
+			}
+		}
+	}
+	check(pos_exact, "positions and normals bit-exact for all vertices");
+	check(uv_ok, "U as-is, V flipped (1 - v) for all vertices");
+	check(w_exact, "all four weights bit-exact for all vertices");
+	check(bone_ok, "positive-weight bones: u8 index == u32 index");
+	check(pin_ok, "zero-weight slots pinned to bone 0");
+	printf("  zero-weight slots pinned: %zu\n", zero_slots);
+
+	/* Malformed input: corrupt vertex 0 (and restore) -- the
+	 * converter must reject without producing output, and the
+	 * restored data must convert again to the identical bytes. */
+	JFAGpuVertex *gv2 = malloc((size_t)c.nv * sizeof(JFAGpuVertex));
+	if (!gv2) {
+		printf("  [FAIL] GPU vertex alloc 2\n");
+		free(gv);
+		jfa_skin_free(&ref);
+		jfa_free(&c);
+		return 1;
+	}
+	check(jfa_gpu_vertices(&c, gv2, (size_t)c.nv) == 1, "reference copy converts");
+	check(memcmp(gv, gv2, (size_t)c.nv * sizeof(JFAGpuVertex)) == 0,
+	      "conversion is deterministic");
+
+	const JFAVertex v0save = c.v[0];
+	int ik = -1, zk = -1;
+	for (int k = 0; k < 4; k++) {
+		if (ik < 0 && v0save.bw[k] > 0.0f)
+			ik = k;
+		if (zk < 0 && v0save.bw[k] == 0.0f)
+			zk = k;
+	}
+
+	if (ik >= 0) {
+		c.v[0].bi[ik] = 9999u;
+		check(jfa_gpu_vertices(&c, gv2, (size_t)c.nv) == 0,
+		      "nonzero-weight bone index >= nb rejected");
+		c.v[0] = v0save;
+
+		c.v[0].bw[ik] += 0.5f;
+		check(jfa_gpu_vertices(&c, gv2, (size_t)c.nv) == 0,
+		      "weight sum != 1 rejected");
+		c.v[0] = v0save;
+
+		c.v[0].bw[ik] = NAN;
+		check(jfa_gpu_vertices(&c, gv2, (size_t)c.nv) == 0,
+		      "NaN weight rejected");
+		c.v[0] = v0save;
+
+		c.v[0].bw[ik] = -0.25f;
+		check(jfa_gpu_vertices(&c, gv2, (size_t)c.nv) == 0,
+		      "negative weight rejected");
+		c.v[0] = v0save;
+	} else {
+		printf("  [SKIP] vertex 0 has no positive-weight slot\n");
+	}
+	if (zk >= 0) {
+		/* A zero-weight slot with a garbage index must still be
+		 * accepted (pinned to bone 0, weight stays exactly 0) --
+		 * invalid NONZERO-weight indices are the ones that
+		 * reject; this one is not hidden, just neutralized. */
+		c.v[0].bi[zk] = 9999u;
+		const int ok = jfa_gpu_vertices(&c, gv2, (size_t)c.nv);
+		check(ok == 1 && gv2[0].bone[zk] == 0 &&
+			      gv2[0].weight[zk] == 0.0f,
+		      "zero-weight garbage index pinned, not hidden");
+		c.v[0] = v0save;
+	} else {
+		printf("  [SKIP] vertex 0 has no zero-weight slot\n");
+	}
+	check(jfa_gpu_vertices(&c, gv2, (size_t)c.nv) == 1 &&
+		      memcmp(gv, gv2, (size_t)c.nv * sizeof(JFAGpuVertex)) == 0,
+	      "restored data converts bit-identically again");
+
+	/* Degenerate character states. */
+	{
+		JFACharacter bad;
+		memset(&bad, 0, sizeof(bad));
+		check(jfa_gpu_vertices(&bad, gv2, 1) == 0,
+		      "unready character rejected");
+
+		bad = c; /* shallow copy: read-only use, never freed */
+		bad.ready = 1;
+		bad.nb = 0;
+		check(jfa_gpu_vertices(&bad, gv2, (size_t)bad.nv) == 0,
+		      "0 bones rejected");
+		bad.nb = JFA_GPU_MAX_BONES + 1;
+		check(jfa_gpu_vertices(&bad, gv2, (size_t)bad.nv) == 0,
+		      "34 bones rejected");
+	}
+
+	free(gv2);
+	free(gv);
 
 	jfa_skin_free(&ref);
 	jfa_free(&c);
