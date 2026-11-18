@@ -302,7 +302,8 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
         DPV(bx - ax * gg.hx * 0.28f - sx * gg.hx * 0.32f,
             by - ay * gg.hy * 0.28f - sy * gg.hy * 0.32f, ar, ag, ab);
     }
-    ntri = n;
+    /* glDrawArrays counts VERTICES, not floats: 6 floats per vertex. */
+    ntri = n / 6;
 
     /* Line pass: pentagon outlines, tip pointing toward center. */
     for (int i = 0; i < 4; i++) {
@@ -353,7 +354,7 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
                           (void *)(3 * sizeof(float)));
     glDisable(GL_DEPTH_TEST);
     glDrawArrays(GL_TRIANGLES, 0, ntri);
-    glDrawArrays(GL_LINES, ntri, n - ntri);
+    glDrawArrays(GL_LINES, ntri, n / 6 - ntri);
     glEnable(GL_DEPTH_TEST);
 }
 
