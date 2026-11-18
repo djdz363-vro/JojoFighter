@@ -82,6 +82,8 @@ enum {
 #define JFA_DPAD_MAX_PX 120.0f
 #define JFA_DPAD_EDGE_PX 8.0f
 #define JFA_DPAD_SPACING 1.22f
+/* Fraction of the full-scale radius: smallest practical center dead zone. */
+#define JFA_ANALOG_DEAD 0.12f
 
 /* One shared geometry, expressed in normalized WINDOW coordinates and
  * used for BOTH touch hit-testing and overlay drawing. Because sizes
@@ -126,12 +128,16 @@ static void jfa_dpad_geom(int vw, int vh, JFADpadGeom *g)
 
 typedef struct {
     SDL_FingerID finger[4]; /* -1 = unused; index 0=UP,1=DOWN,2=LEFT,3=RIGHT */
+    SDL_FingerID analogFinger; /* -1 = no finger owns analogue control */
+    float analogX, analogY;    /* unit direction from cluster center */
 } JFADpad;
 
 static void jfa_dpad_reset(JFADpad *d)
 {
     for (int i = 0; i < 4; i++)
         d->finger[i] = -1;
+    d->analogFinger = -1;
+    d->analogX = d->analogY = 0.0f;
 }
 
 /* Returns the direction mask under a normalized touch: one button bit,
@@ -241,6 +247,103 @@ static unsigned jfa_dpad_mask(const JFADpad *d)
     return mask;
 }
 
+/* Continuous 360-degree virtual stick built on the existing visual D-pad.
+ * Full scale is the distance from the cluster center to a button center;
+ * the activation circle is the MINIMAL one that encloses all four old
+ * button rects: hypot(half-button, spacing+half-button) in window pixels.
+ * Returns 1 and a unit direction for any touch inside that circle, 0 if
+ * the touch is outside. The center dead zone returns a zero vector. */
+static int jfa_dpad_analog(float nx, float ny, int vw, int vh,
+                           float *vx, float *vy)
+{
+    JFADpadGeom g;
+    float ox, oy, len, full, activate, dead;
+
+    jfa_dpad_geom(vw, vh, &g);
+    /* Window-pixel offsets: correct for portrait and landscape aspect
+     * ratios and consistent with hit-testing (which uses window coords). */
+    ox = (nx - g.cx) * (float)vw;
+    oy = (ny - g.cy) * (float)vh;
+    full = g.gx * (float)vw;              /* == g.gy * vh == 1.22*s px */
+    activate = sqrtf((g.hx * (float)vw) * (g.hx * (float)vw) +
+                     ((g.gx + g.hx) * (float)vw) *
+                     ((g.gx + g.hx) * (float)vw));
+    len = sqrtf(ox * ox + oy * oy);
+    if (full <= 0.0f || len > activate)
+        return 0;
+    dead = JFA_ANALOG_DEAD * full;
+    if (len <= dead) {
+        *vx = *vy = 0.0f;
+        return 1;
+    }
+    *vx = ox / len;
+    *vy = oy / len;
+    return 1;
+}
+
+/* First eligible finger owns the analogue control. Other fingers cannot
+ * steal or modify it. A touch outside the control circle is ignored. */
+static int jfa_dpad_analog_apply(JFADpad *d, SDL_FingerID id,
+                                 float nx, float ny, int vw, int vh)
+{
+    float vx = 0.0f, vy = 0.0f;
+
+    if (d->analogFinger >= 0 && d->analogFinger != id)
+        return 0;
+    if (!jfa_dpad_analog(nx, ny, vw, vh, &vx, &vy))
+        return 0;
+    d->analogFinger = id;
+    d->analogX = vx;
+    d->analogY = vy;
+    return 1;
+}
+
+static void jfa_dpad_analog_release(JFADpad *d, SDL_FingerID id)
+{
+    if (d->analogFinger == id) {
+        d->analogFinger = -1;
+        d->analogX = d->analogY = 0.0f;
+    }
+}
+
+/* Reuse the accepted four-button highlight for analogue feedback: light
+ * the buttons whose axes are predominant. Drawing itself is untouched. */
+static unsigned jfa_dpad_visual_mask(const JFADpad *d)
+{
+    unsigned mask = jfa_dpad_mask(d);
+
+    if (d->analogFinger >= 0) {
+        if (d->analogX <= -0.5f) mask |= JFA_DIR_LEFT;
+        if (d->analogX >=  0.5f) mask |= JFA_DIR_RIGHT;
+        if (d->analogY <= -0.5f) mask |= JFA_DIR_UP;
+        if (d->analogY >=  0.5f) mask |= JFA_DIR_DOWN;
+    }
+    return mask;
+}
+
+/* Per-arm highlight levels: digital slots give 1/0, analogue gives the
+ * signed axis component, clamped to 0..1. This is display-only — the
+ * movement vector itself remains continuous and unquantized. */
+static void jfa_dpad_visual_levels(const JFADpad *d, float out[4])
+{
+    unsigned mask = jfa_dpad_mask(d);
+
+    out[0] = (mask & JFA_DIR_UP)    ? 1.0f : 0.0f;
+    out[1] = (mask & JFA_DIR_DOWN)  ? 1.0f : 0.0f;
+    out[2] = (mask & JFA_DIR_LEFT)  ? 1.0f : 0.0f;
+    out[3] = (mask & JFA_DIR_RIGHT) ? 1.0f : 0.0f;
+    if (d->analogFinger >= 0) {
+        float up = -d->analogY, down = d->analogY;
+        float left = -d->analogX, right = d->analogX;
+        if (up > out[0]) out[0] = up;
+        if (down > out[1]) out[1] = down;
+        if (left > out[2]) out[2] = left;
+        if (right > out[3]) out[3] = right;
+        for (int i = 0; i < 4; i++)
+            if (out[i] > 1.0f) out[i] = 1.0f;
+    }
+}
+
 /* TEMPORARY device diagnostics: shows raw SDL finger coordinates, the
  * window size used for hit-testing, the GL drawable size, the resolved
  * button and the resulting direction mask. Set JFA_DPAD_DEBUG=0 to
@@ -266,14 +369,17 @@ static void jfa_dpad_log(SDL_Window *win, const char *what,
 #define JFA_DPAD_LOG(win, what, id, nx, ny, vw, vh, mask) do {} while (0)
 #endif
 
-/* PSP-style D-pad overlay: four pentagonal buttons with arrow glyphs.
+/* PSP-style D-pad overlay: four outlined directional sections arranged in
+ * a cross. Each section is a rectangle with a diagonal-pointed inner edge;
+ * their tips form a small diamond gap around the center. Interiors stay
+ * transparent and arrows are hollow, matching the PPSSPP reference.
  * Uses only the existing flat-color program path (uTextMode=1) and a
  * dedicated dynamic VBO; no character/GPU skinning state is touched.
  * The shared fragment shader hardcodes alpha=1, so 'translucency' is
- * approximated with subdued grey tones over the dark arena. */
+ * represented by drawing outlines only. */
 static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
                           GLint mvp, GLint mode, int w, int h,
-                          unsigned mask)
+                          const float levels[4])
 {
     float v[1024];
     int n = 0, ntri;
@@ -281,9 +387,6 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
     const float dirs[4][2] = {
         { 0.0f, -1.0f }, { 0.0f, 1.0f },
         { -1.0f, 0.0f }, { 1.0f, 0.0f }
-    };
-    const int bits[4] = {
-        JFA_DIR_UP, JFA_DIR_DOWN, JFA_DIR_LEFT, JFA_DIR_RIGHT
     };
     /* Geometry comes from WINDOW coordinates (same as hit testing);
      * identity clip space maps directly onto the GL viewport, so
@@ -303,66 +406,53 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
     v[n++] = 0.0f; v[n++] = r; v[n++] = g; v[n++] = b; \
 } while (0)
 
-    /* Triangle pass: subtle button backgrounds + direction arrows. */
-    for (int i = 0; i < 4; i++) {
-        const float bx = gg.cx + dirs[i][0] * gg.gx;
-        const float by = gg.cy + dirs[i][1] * gg.gy;
-        const int pressed = (mask & (unsigned)bits[i]) != 0;
-        const float br = pressed ? 0.40f : 0.20f;
-        const float bg = pressed ? 0.40f : 0.21f;
-        const float bb = pressed ? 0.26f : 0.24f;
-        const float ar = pressed ? 1.0f : 0.78f;
-        const float ag = pressed ? 0.90f : 0.78f;
-        const float ab = pressed ? 0.50f : 0.78f;
-        DPV(bx - gg.hx, by - gg.hy, br, bg, bb);
-        DPV(bx + gg.hx, by - gg.hy, br, bg, bb);
-        DPV(bx + gg.hx, by + gg.hy, br, bg, bb);
-        DPV(bx - gg.hx, by - gg.hy, br, bg, bb);
-        DPV(bx + gg.hx, by + gg.hy, br, bg, bb);
-        DPV(bx - gg.hx, by + gg.hy, br, bg, bb);
-        /* Arrow points away from the D-pad center. */
-        const float ax = dirs[i][0], ay = dirs[i][1];
-        const float sx = -ay, sy = ax;
-        DPV(bx + ax * gg.hx * 0.48f, by + ay * gg.hy * 0.48f,
-            ar, ag, ab);
-        DPV(bx - ax * gg.hx * 0.28f + sx * gg.hx * 0.32f,
-            by - ay * gg.hy * 0.28f + sy * gg.hy * 0.32f, ar, ag, ab);
-        DPV(bx - ax * gg.hx * 0.28f - sx * gg.hx * 0.32f,
-            by - ay * gg.hy * 0.28f - sy * gg.hy * 0.32f, ar, ag, ab);
-    }
-    /* glDrawArrays counts VERTICES, not floats: 6 floats per vertex. */
-    ntri = n / 6;
+    /* No filled geometry: the section interiors stay transparent. */
+    ntri = n / 6;   /* 0 */
 
-    /* Line pass: pentagon outlines, tip pointing toward center. */
+    /* Four outlined pentagons: rectangle + diagonal point toward center,
+     * using the unchanged button centers and half-sizes. */
     for (int i = 0; i < 4; i++) {
-        const float bx = gg.cx + dirs[i][0] * gg.gx;
-        const float by = gg.cy + dirs[i][1] * gg.gy;
-        const int pressed = (mask & (unsigned)bits[i]) != 0;
-        const float r = pressed ? 1.0f : 0.82f;
-        const float g = pressed ? 0.90f : 0.82f;
-        const float b = pressed ? 0.50f : 0.82f;
-        /* local +y axis points toward the D-pad center */
-        const float ay2 = -dirs[i][1], ax2 = -dirs[i][0];
-        const float ux = -ay2, uy = ax2; /* local +x perpendicular */
-        const float lp[5][2] = {
-            { -gg.hx, -gg.hy }, { gg.hx, -gg.hy },
-            { gg.hx, gg.hy * 0.2f }, { 0.0f, gg.hy },
-            { -gg.hx, gg.hy * 0.2f }
-        };
+        const float dx = dirs[i][0], dy = dirs[i][1];
+        const float ux = -dy, uy = dx;
+        const float bx = gg.cx + dx * gg.gx;
+        const float by = gg.cy + dy * gg.gy;
+        const float hd = fabsf(dx) * gg.hx + fabsf(dy) * gg.hy;
+        const float hu = fabsf(ux) * gg.hx + fabsf(uy) * gg.hy;
+        const float gd = fabsf(dx) * gg.gx + fabsf(dy) * gg.gy;
+        const float lv = fmaxf(0.0f, fminf(1.0f, levels[i]));
+
         float p[5][2];
-        for (int k = 0; k < 5; k++) {
-            /* hx is width-normalized, hy is height-normalized. Rotate the
-             * pentagon in pixel space so LEFT/RIGHT stay square in pixels. */
-            const float lxp = lp[k][0] * (float)w;
-            const float lyp = lp[k][1] * (float)h;
-            p[k][0] = bx + (lxp * ux + lyp * ax2) / (float)w;
-            p[k][1] = by + (lxp * uy + lyp * ay2) / (float)h;
-        }
+        /* outer-left, outer-right, inner-right, center-point, inner-left */
+        p[0][0] = bx + dx * hd - ux * hu;  p[0][1] = by + dy * hd - uy * hu;
+        p[1][0] = bx + dx * hd + ux * hu;  p[1][1] = by + dy * hd + uy * hu;
+        p[2][0] = bx - dx * hd + ux * hu;  p[2][1] = by - dy * hd + uy * hu;
+        p[3][0] = bx - dx * 0.84f * gd;    p[3][1] = by - dy * 0.84f * gd;
+        p[4][0] = bx - dx * hd - ux * hu;  p[4][1] = by - dy * hd - uy * hu;
+
+        const float r = 0.66f + 0.34f * lv;
+        const float g = 0.69f + 0.21f * lv;
+        const float b = 0.74f - 0.24f * lv;
         for (int k = 0; k < 5; k++) {
             int t = (k + 1) % 5;
             DPV(p[k][0], p[k][1], r, g, b);
             DPV(p[t][0], p[t][1], r, g, b);
         }
+
+        /* Hollow outward arrow inside the rectangular part. */
+        const float tipx = bx + dx * 0.46f * hd;
+        const float tipy = by + dy * 0.46f * hd;
+        const float bcx = bx - dx * 0.24f * hd;
+        const float bcy = by - dy * 0.24f * hd;
+        const float b1x = bcx + ux * 0.32f * hu;
+        const float b1y = bcy + uy * 0.32f * hu;
+        const float b2x = bcx - ux * 0.32f * hu;
+        const float b2y = bcy - uy * 0.32f * hu;
+        const float ar = 0.74f + 0.26f * lv;
+        const float ag = 0.76f + 0.20f * lv;
+        const float ab = 0.80f - 0.10f * lv;
+        DPV(tipx, tipy, ar, ag, ab);  DPV(b1x, b1y, ar, ag, ab);
+        DPV(b1x, b1y, ar, ag, ab);    DPV(b2x, b2y, ar, ag, ab);
+        DPV(b2x, b2y, ar, ag, ab);    DPV(tipx, tipy, ar, ag, ab);
     }
 #undef DPV
 
@@ -923,26 +1013,43 @@ double freq = (double)SDL_GetPerformanceFrequency();
     }
 #endif
     else if (e.type == SDL_FINGERDOWN) {
-        jfa_dpad_down(&dpad, e.tfinger.fingerId,
-                      e.tfinger.x, e.tfinger.y, inputW, inputH);
+        /* First touch inside the analogue circle claims continuous
+         * control; others fall through to the existing digital path. */
+        if (!jfa_dpad_analog_apply(&dpad, e.tfinger.fingerId,
+                                   e.tfinger.x, e.tfinger.y,
+                                   inputW, inputH))
+            jfa_dpad_down(&dpad, e.tfinger.fingerId,
+                          e.tfinger.x, e.tfinger.y, inputW, inputH);
         JFA_DPAD_LOG(win, "DOWN", e.tfinger.fingerId,
                      e.tfinger.x, e.tfinger.y, inputW, inputH,
-                     jfa_dpad_mask(&dpad));
+                     jfa_dpad_visual_mask(&dpad));
     } else if (e.type == SDL_FINGERMOTION) {
-        const unsigned before = jfa_dpad_mask(&dpad);
-        jfa_dpad_motion(&dpad, e.tfinger.fingerId,
-                        e.tfinger.x, e.tfinger.y, inputW, inputH);
-        const unsigned after = jfa_dpad_mask(&dpad);
+        const unsigned before = jfa_dpad_visual_mask(&dpad);
+        if (dpad.analogFinger == e.tfinger.fingerId) {
+            /* Leaving the circle stops movement but keeps ownership
+             * until release; re-entering resumes continuous control. */
+            float vx = 0.0f, vy = 0.0f;
+            if (!jfa_dpad_analog(e.tfinger.x, e.tfinger.y,
+                                 inputW, inputH, &vx, &vy))
+                vx = vy = 0.0f;
+            dpad.analogX = vx;
+            dpad.analogY = vy;
+        } else {
+            jfa_dpad_motion(&dpad, e.tfinger.fingerId,
+                            e.tfinger.x, e.tfinger.y, inputW, inputH);
+        }
+        const unsigned after = jfa_dpad_visual_mask(&dpad);
         if (after != before)
             JFA_DPAD_LOG(win, "MOVE", e.tfinger.fingerId,
                          e.tfinger.x, e.tfinger.y, inputW, inputH, after);
     } else if (e.type == SDL_FINGERUP) {
-        const unsigned before = jfa_dpad_mask(&dpad);
+        const unsigned before = jfa_dpad_visual_mask(&dpad);
+        jfa_dpad_analog_release(&dpad, e.tfinger.fingerId);
         jfa_dpad_up(&dpad, e.tfinger.fingerId);
-        if (before != jfa_dpad_mask(&dpad))
+        if (before != jfa_dpad_visual_mask(&dpad))
             JFA_DPAD_LOG(win, "UP", e.tfinger.fingerId,
                          e.tfinger.x, e.tfinger.y, inputW, inputH,
-                         jfa_dpad_mask(&dpad));
+                         jfa_dpad_visual_mask(&dpad));
     }
   }
   double animationTime =
@@ -985,6 +1092,12 @@ double freq = (double)SDL_GetPerformanceFrequency();
     if (dmask & JFA_DIR_DOWN)  dz += 1.0f;
     if (dmask & JFA_DIR_LEFT)  dx -= 1.0f;
     if (dmask & JFA_DIR_RIGHT) dx += 1.0f;
+    /* Analogue unit vector is summed with keyboard/digital input; the
+     * existing normalization keeps speed constant for any combination. */
+    if (dpad.analogFinger >= 0) {
+        dx += dpad.analogX;
+        dz += dpad.analogY;
+    }
     jfa_move_step(charPos, &charFacing, dx, dz, dt,
                   xLimit, backZ, frontZ);
   }
@@ -1239,8 +1352,10 @@ glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
   }
   frames++;Uint64 now=SDL_GetPerformanceCounter();if((double)(now-start)/freq>=.5){fps=(int)(frames*freq/(double)(now-start)+.5);frames=0;start=now;}
   drawFPS(prog,fpsVBO,pos,col,mvpLoc,modeLoc,w,h,fps);
+  float levels[4];
+  jfa_dpad_visual_levels(&dpad, levels);
   jfa_dpad_draw(prog, dpadVBO, pos, col, mvpLoc, modeLoc,
-                inputW, inputH, jfa_dpad_mask(&dpad)); /* overlay only; character path untouched */
+                inputW, inputH, levels); /* overlay only; character path untouched */
   SDL_GL_SwapWindow(win);
  }
  glDeleteBuffers(1, &meshVBO);
