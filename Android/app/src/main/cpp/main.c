@@ -322,11 +322,14 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
             { -gg.hx, gg.hy * 0.2f }
         };
         float p[5][2];
-        for (int k = 0; k < 5; k++)
-            for (int q = 0; q < 2; q++)
-                p[k][q] = (q == 0) ?
-                    (bx + lp[k][0] * ux + lp[k][1] * ax2) :
-                    (by + lp[k][0] * uy + lp[k][1] * ay2);
+        for (int k = 0; k < 5; k++) {
+            /* hx is width-normalized, hy is height-normalized. Rotate the
+             * pentagon in pixel space so LEFT/RIGHT stay square in pixels. */
+            const float lxp = lp[k][0] * (float)w;
+            const float lyp = lp[k][1] * (float)h;
+            p[k][0] = bx + (lxp * ux + lyp * ax2) / (float)w;
+            p[k][1] = by + (lxp * uy + lyp * ay2) / (float)h;
+        }
         for (int k = 0; k < 5; k++) {
             int t = (k + 1) % 5;
             DPV(p[k][0], p[k][1], r, g, b);
