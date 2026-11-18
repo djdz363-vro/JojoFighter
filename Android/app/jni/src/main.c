@@ -19,6 +19,7 @@ static int jfaOK = 0;
 static int jfaClip = JFA_IDLE;
 static double jfaClipStart = 0.0;   /* animationTime when clip began */
 static double jfaClipDur = 0.0;     /* seconds of the current clip */
+static float lastMoveDx = 0.0f, lastMoveDz = 0.0f; /* locomotion clip selection */
 static float jfaScale = 1.0f;
 static float jfaCenter[3] = { 0, 0, 0 };
 /* PERF accumulators (like fbx_loader.c): averaged over 60 frames. */
@@ -237,6 +238,17 @@ static void jfa_dpad_up(JFADpad *d, SDL_FingerID id)
             d->finger[i] = -1;
 }
 
+static void jfa_dpad_cancel(JFADpad *d, SDL_FingerID id)
+{
+    if (d->analogFinger == id) {
+        d->analogFinger = -1;
+        d->analogX = d->analogY = 0.0f;
+    }
+    for (int i = 0; i < 4; i++)
+        if (d->finger[i] == id)
+            d->finger[i] = -1;
+}
+
 static unsigned jfa_dpad_mask(const JFADpad *d)
 {
     unsigned mask = 0;
@@ -342,6 +354,235 @@ static void jfa_dpad_visual_levels(const JFADpad *d, float out[4])
         for (int i = 0; i < 4; i++)
             if (out[i] > 1.0f) out[i] = 1.0f;
     }
+}
+
+/* Stage scale: all arena dimensions grow by 1.35 and the walls become
+ * proportionately taller for a more cube-like room. Camera lifts slightly
+ * and pitches down a few degrees while keeping the character framed. */
+#define JFA_ARENA_SCALE 1.35f
+#define JFA_ARENA_HALF (4.2f * JFA_ARENA_SCALE)
+#define JFA_CAMERA_Y (-1.28f)
+#define JFA_CAMERA_Z (-3.85f)
+#define JFA_CAMERA_PITCH 0.055f
+
+/* ---- M3.2-A: first basic attack. One named clip, one independent touch
+ * owner, and a pure clip-selection helper shared by CPU/GPU paths. ---- */
+#define JFA_ATTACK_CLIP JFA_PUNCH_RIGHT
+#define JFA_ATTACK_NX 0.62f   /* clear of D-pad and every PSP-style control */
+#define JFA_ATTACK_NY 0.58f
+#define JFA_ATTACK_RADIUS 0.65f   /* fraction of s (button size) */
+
+/* Locomotion is explicit: IDLE when stationary, WALK forward/lateral,
+ * BACKWALK backward. GUARD and all attack/reaction clips are reserved for
+ * explicit game states and are NEVER auto-selected. */
+static int jfa_locomotion_clip_for(float dx, float dz)
+{
+    if (fabsf(dx) < 0.001f && fabsf(dz) < 0.001f)
+        return JFA_IDLE;
+    if (dz < -0.001f) return JFA_WALK;
+    if (dz >  0.001f) return JFA_BACKWALK;
+    return JFA_WALK;   /* pure sideways movement keeps the walk cycle */
+}
+
+typedef struct {
+    int active;              /* 1 while the attack clip is playing */
+    double start;            /* animationTime when triggered */
+    double savedElapsed;     /* locomotion elapsed time to restore */
+    SDL_FingerID finger;     /* owner touch, -1 for keyboard */
+} JFAAttack;
+
+typedef struct {
+    int clip;                /* clip index to sample this frame */
+    double time;             /* seconds into that clip */
+} JFAAnimSample;
+
+static int jfa_attack_trigger(JFAAttack *a, double now,
+                              double locoElapsed, SDL_FingerID finger)
+{
+    if (a->active)
+        return 0;            /* no interruption of an active attack */
+    a->active = 1;
+    a->start = now;
+    a->savedElapsed = locoElapsed;
+    a->finger = finger;
+    return 1;
+}
+
+/* Releasing the owning finger does NOT cancel the animation: it plays to
+ * its full duration. Cancellation/reset is handled separately. */
+static void jfa_attack_release(JFAAttack *a, SDL_FingerID finger)
+{
+    if (a->finger == finger)
+        a->finger = -1;
+}
+
+static void jfa_attack_reset(JFAAttack *a)
+{
+    a->active = 0;
+    a->start = 0.0;
+    a->savedElapsed = 0.0;
+    a->finger = -1;
+}
+
+/* Pure clip selector. Mutates only the attack state and the locomotion
+ * cursor/start time; all callers (CPU and GPU) use the returned sample. */
+static JFAAnimSample jfa_anim_select(JFAAttack *a, double now,
+                                     int *locoClip, double *locoStart,
+                                     const JFAClip *clips,
+                                     float dx, float dz)
+{
+    JFAAnimSample s;
+
+    if (a->active) {
+        const JFAClip *ac = &clips[JFA_ATTACK_CLIP];
+        double dur = (double)ac->frames / (double)ac->fps;
+        double t = now - a->start;
+        if (t < dur) {
+            s.clip = JFA_ATTACK_CLIP;
+            s.time = t;
+            return s;
+        }
+        /* Attack finished: restore the locomotion clip and its elapsed time. */
+        a->active = 0;
+        a->finger = -1;
+        *locoStart = now - a->savedElapsed;
+    }
+
+    /* Movement selects the locomotion clip; no automatic cycling. */
+    {
+        int target = jfa_locomotion_clip_for(dx, dz);
+        if (target != *locoClip) {
+            *locoClip = target;
+            *locoStart = now;
+        }
+    }
+    s.clip = *locoClip;
+    {
+        const JFAClip *lc = &clips[s.clip];
+        double dur = (double)lc->frames / (double)lc->fps;
+        double elapsed = now - *locoStart;
+        if (elapsed >= dur) {
+            *locoStart = now;
+            elapsed = 0.0;
+        }
+        s.time = elapsed;
+    }
+    return s;
+}
+
+/* Bottom-right attack zone. Radius is in window pixels, so it stays clear
+ * of the bottom-left analogue circle at every supported resolution. */
+static int jfa_attack_hit(float nx, float ny, int vw, int vh)
+{
+    JFADpadGeom g;
+    float halfPx, rpx, dx, dy;
+
+    if (vw < 1 || vh < 1)
+        return 0;
+    jfa_dpad_geom(vw, vh, &g);
+    halfPx = g.hx * (float)vw;              /* s/2 in pixels */
+    rpx = JFA_ATTACK_RADIUS * halfPx;
+    dx = (nx - JFA_ATTACK_NX) * (float)vw;
+    dy = (ny - JFA_ATTACK_NY) * (float)vh;
+    return (dx * dx + dy * dy <= rpx * rpx);
+}
+
+/* ---- M3.2-A: extra PSP-style controls (visual/input only, no gameplay).
+ * Independent finger per button; press/release only changes highlight. ---- */
+enum {
+    JFA_BTN_MENU = 0, JFA_BTN_FF, JFA_BTN_SELECT, JFA_BTN_START,
+    JFA_BTN_L, JFA_BTN_R, JFA_BTN_TRI, JFA_BTN_SQUARE,
+    JFA_BTN_CIRCLE, JFA_BTN_X, JFA_BTN_TOPLEFT, JFA_BTN_COUNT
+};
+typedef struct {
+    SDL_FingerID finger[JFA_BTN_COUNT];
+} JFAButtons;
+
+static const float jfaButtonX[JFA_BTN_COUNT] = {
+    0.50f, 0.65f, 0.73f, 0.81f,
+    0.15f, 0.85f, 0.83f, 0.75f,
+    0.91f, 0.83f, 0.18f
+};
+static const float jfaButtonY[JFA_BTN_COUNT] = {
+    0.07f, 0.90f, 0.90f, 0.90f,
+    0.28f, 0.28f, 0.55f, 0.66f,
+    0.66f, 0.77f, 0.07f
+};
+/* 0 = circle, 1 = rectangle */
+static const unsigned char jfaButtonShape[JFA_BTN_COUNT] = {
+    0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0
+};
+
+static void jfa_button_extents(int id, int vw, int vh, float *hw, float *hh)
+{
+    JFADpadGeom g;
+    float halfPx;
+
+    jfa_dpad_geom(vw, vh, &g);
+    halfPx = g.hx * (float)vw;              /* s/2 in pixels */
+    if (id == JFA_BTN_L || id == JFA_BTN_R) {
+        *hw = 0.90f * halfPx;               /* wide shoulder trapezoid */
+        *hh = 0.40f * halfPx;
+    } else {
+        /* FF / SELECT / START: compact but comfortably tappable. The same
+         * extents are used by the hit test and the outline draw. */
+        *hw = 0.40f * halfPx;
+        *hh = 0.50f * halfPx;
+    }
+}
+
+static void jfa_buttons_reset(JFAButtons *b)
+{
+    for (int i = 0; i < JFA_BTN_COUNT; i++)
+        b->finger[i] = -1;
+}
+
+static int jfa_buttons_hit(int id, float nx, float ny, int vw, int vh)
+{
+    float halfPx, dx, dy;
+
+    if (id < 0 || id >= JFA_BTN_COUNT || vw < 1 || vh < 1)
+        return -1;
+    {
+        JFADpadGeom g;
+        jfa_dpad_geom(vw, vh, &g);
+        halfPx = g.hx * (float)vw;
+    }
+    dx = (nx - jfaButtonX[id]) * (float)vw;
+    dy = (ny - jfaButtonY[id]) * (float)vh;
+    if (jfaButtonShape[id] == 0) {
+        float r = (id == JFA_BTN_MENU || id == JFA_BTN_TOPLEFT) ?
+                  0.50f * halfPx : 0.65f * halfPx;
+        return (dx * dx + dy * dy <= r * r) ? id : -1;
+    }
+    {
+        float hw, hh;
+        jfa_button_extents(id, vw, vh, &hw, &hh);
+        return (fabsf(dx) <= hw && fabsf(dy) <= hh) ? id : -1;
+    }
+}
+
+static int jfa_buttons_find(float nx, float ny, int vw, int vh)
+{
+    for (int i = 0; i < JFA_BTN_COUNT; i++)
+        if (jfa_buttons_hit(i, nx, ny, vw, vh) == i)
+            return i;
+    return -1;
+}
+
+static int jfa_buttons_down(JFAButtons *b, int id, SDL_FingerID finger)
+{
+    if (id < 0 || id >= JFA_BTN_COUNT || b->finger[id] >= 0)
+        return 0;
+    b->finger[id] = finger;
+    return 1;
+}
+
+static void jfa_buttons_up(JFAButtons *b, SDL_FingerID finger)
+{
+    for (int i = 0; i < JFA_BTN_COUNT; i++)
+        if (b->finger[i] == finger)
+            b->finger[i] = -1;
 }
 
 /* TEMPORARY device diagnostics: shows raw SDL finger coordinates, the
@@ -479,6 +720,215 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
     glEnable(GL_DEPTH_TEST);
 }
 
+/* M3.2-A: temporary attack button, drawn with the same flat-color path.
+ * Own VBO/geometry: the verified D-pad overlay is not touched. */
+static void jfa_attack_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
+                            GLint mvp, GLint mode, int w, int h, int active)
+{
+    float v[1024];
+    int n = 0, ntri, k;
+    const int seg = 24;
+    JFADpadGeom g;
+    float cx, cy, rnx, rny;
+
+    if (w < 1 || h < 1)
+        return;
+    jfa_dpad_geom(w, h, &g);
+    cx = JFA_ATTACK_NX;
+    cy = JFA_ATTACK_NY;
+    /* Same radius definition as jfa_attack_hit(); circular in pixels. */
+    rnx = JFA_ATTACK_RADIUS * g.hx;
+    rny = JFA_ATTACK_RADIUS * g.hy;
+
+#define ADPV(px_, py_, r_, g_, b_) do { \
+    float x_ = (px_), y_ = (py_); \
+    if (x_ < 0.0f) { x_ = 0.0f; } \
+    if (x_ > 1.0f) { x_ = 1.0f; } \
+    if (y_ < 0.0f) { y_ = 0.0f; } \
+    if (y_ > 1.0f) { y_ = 1.0f; } \
+    v[n++] = 2.0f * x_ - 1.0f; \
+    v[n++] = 1.0f - 2.0f * y_; \
+    v[n++] = 0.0f; v[n++] = r_; v[n++] = g_; v[n++] = b_; \
+} while (0)
+
+    {
+        const float fr = active ? 0.38f : 0.16f;
+        const float fg = active ? 0.36f : 0.17f;
+        const float fb = active ? 0.24f : 0.20f;
+        for (k = 0; k < seg; k++) {
+            double a0 = 2.0 * 3.14159265358979323846 * k / seg;
+            double a1 = 2.0 * 3.14159265358979323846 * (k + 1) / seg;
+            ADPV(cx, cy, fr, fg, fb);
+            ADPV(cx + rnx * (float)cos(a0), cy + rny * (float)sin(a0), fr, fg, fb);
+            ADPV(cx + rnx * (float)cos(a1), cy + rny * (float)sin(a1), fr, fg, fb);
+        }
+    }
+    ntri = n / 6;
+    {
+        const float lr = active ? 1.00f : 0.66f;
+        const float lg = active ? 0.90f : 0.69f;
+        const float lb = active ? 0.50f : 0.74f;
+        for (k = 0; k < seg; k++) {
+            double a0 = 2.0 * 3.14159265358979323846 * k / seg;
+            double a1 = 2.0 * 3.14159265358979323846 * (k + 1) / seg;
+            ADPV(cx + rnx * (float)cos(a0), cy + rny * (float)sin(a0), lr, lg, lb);
+            ADPV(cx + rnx * (float)cos(a1), cy + rny * (float)sin(a1), lr, lg, lb);
+        }
+    }
+#undef ADPV
+
+    if (n > (int)(sizeof(v) / sizeof(v[0])))
+        return;
+    static const float ident[16] = {
+        1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
+    };
+    glUseProgram(prog);
+    glUniformMatrix4fv(mvp, 1, GL_FALSE, ident);
+    glUniform1f(mode, 1.0f);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (size_t)n * sizeof(float), v, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(pos);
+    glEnableVertexAttribArray(col);
+    glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)0);
+    glVertexAttribPointer(col, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+                          (void *)(3 * sizeof(float)));
+    glDisable(GL_DEPTH_TEST);
+    glDrawArrays(GL_TRIANGLES, 0, ntri);
+    glDrawArrays(GL_LINES, ntri, n / 6 - ntri);
+    glEnable(GL_DEPTH_TEST);
+}
+
+/* M3.2-A: draw the extra PSP-style controls. Separate VBO; game logic is
+ * untouched and press state only changes highlight colors. */
+static void jfa_buttons_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
+                             GLint mvp, GLint mode, int w, int h,
+                             const JFAButtons *buttons)
+{
+    float v[4096];
+    int n = 0, ntri, i, k;
+
+    if (w < 1 || h < 1)
+        return;
+#define BPV(nx_, ny_, rr_, gg_, bb_) do { \
+    float x_ = (nx_), y_ = (ny_); \
+    if (x_ < 0.0f) { x_ = 0.0f; } \
+    if (x_ > 1.0f) { x_ = 1.0f; } \
+    if (y_ < 0.0f) { y_ = 0.0f; } \
+    if (y_ > 1.0f) { y_ = 1.0f; } \
+    v[n++] = 2.0f * x_ - 1.0f; \
+    v[n++] = 1.0f - 2.0f * y_; \
+    v[n++] = 0.0f; v[n++] = rr_; v[n++] = gg_; v[n++] = bb_; \
+} while (0)
+
+    /* half button size in px, matching jfa_dpad_geom()'s window units */
+    {
+        JFADpadGeom gg;
+        float halfPx, rx, rxSmall, hw, hh;
+        jfa_dpad_geom(w, h, &gg);
+        halfPx = gg.hx * (float)w;
+        rx = 0.65f * halfPx;
+        rxSmall = 0.50f * halfPx;
+        hw = halfPx;
+        hh = 0.50f * halfPx;
+
+        for (i = 0; i < JFA_BTN_COUNT; i++) {
+            float cx = jfaButtonX[i], cy = jfaButtonY[i];
+            float nxr = (jfaButtonShape[i] == 0 ?
+                         (i == JFA_BTN_MENU || i == JFA_BTN_TOPLEFT ? rxSmall : rx) : hw) / (float)w;
+            float nyr = (jfaButtonShape[i] == 0 ?
+                         (i == JFA_BTN_MENU || i == JFA_BTN_TOPLEFT ? rxSmall : rx) : hh) / (float)h;
+            int pressed = buttons->finger[i] >= 0;
+            float cr = pressed ? 1.00f : 0.68f;
+            float cg = pressed ? 0.90f : 0.70f;
+            float cb = pressed ? 0.50f : 0.75f;
+
+            if (jfaButtonShape[i] == 0) {
+                for (k = 0; k < 16; k++) {
+                    double a0 = 2.0 * 3.14159265358979323846 * k / 16.0;
+                    double a1 = 2.0 * 3.14159265358979323846 * (k + 1) / 16.0;
+                    BPV(cx + nxr * (float)cos(a0), cy + nyr * (float)sin(a0), cr, cg, cb);
+                    BPV(cx + nxr * (float)cos(a1), cy + nyr * (float)sin(a1), cr, cg, cb);
+                }
+            } else {
+                float lhw, lhh;
+                jfa_button_extents(i, w, h, &lhw, &lhh);
+                float xr = lhw / (float)w, yr = lhh / (float)h;
+                BPV(cx-xr, cy-yr, cr,cg,cb); BPV(cx+xr, cy-yr, cr,cg,cb);
+                BPV(cx+xr, cy-yr, cr,cg,cb); BPV(cx+xr, cy+yr, cr,cg,cb);
+                BPV(cx+xr, cy+yr, cr,cg,cb); BPV(cx-xr, cy+yr, cr,cg,cb);
+                BPV(cx-xr, cy+yr, cr,cg,cb); BPV(cx-xr, cy-yr, cr,cg,cb);
+            }
+
+            /* simple glyphs, drawn as thin lines */
+            if (i == JFA_BTN_MENU) {
+                for (k = -1; k <= 1; k++) {
+                    float yy = cy + k * nyr * 0.45f;
+                    BPV(cx - nxr*0.45f, yy, cr,cg,cb);
+                    BPV(cx + nxr*0.45f, yy, cr,cg,cb);
+                }
+            } else if (i == JFA_BTN_FF) {
+                for (k = 0; k < 2; k++) {
+                    float xx = cx + (k ? nxr*0.35f : -nxr*0.35f);
+                    BPV(xx-nxr*0.18f, cy-nyr*0.45f, cr,cg,cb);
+                    BPV(xx+nxr*0.18f, cy, cr,cg,cb);
+                    BPV(xx+nxr*0.18f, cy, cr,cg,cb);
+                    BPV(xx-nxr*0.18f, cy+nyr*0.45f, cr,cg,cb);
+                }
+            } else if (i == JFA_BTN_TRI) {
+                BPV(cx, cy-nyr*0.55f, cr,cg,cb);
+                BPV(cx-nxr*0.50f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx-nxr*0.50f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx+nxr*0.50f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx+nxr*0.50f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx, cy-nyr*0.55f, cr,cg,cb);
+            } else if (i == JFA_BTN_SQUARE) {
+                BPV(cx-nxr*0.45f, cy-nyr*0.45f, cr,cg,cb);
+                BPV(cx+nxr*0.45f, cy-nyr*0.45f, cr,cg,cb);
+                BPV(cx+nxr*0.45f, cy-nyr*0.45f, cr,cg,cb);
+                BPV(cx+nxr*0.45f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx+nxr*0.45f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx-nxr*0.45f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx-nxr*0.45f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx-nxr*0.45f, cy-nyr*0.45f, cr,cg,cb);
+            } else if (i == JFA_BTN_CIRCLE || i == JFA_BTN_TOPLEFT) {
+                for (k = 0; k < 12; k++) {
+                    double a0 = 2.0 * 3.14159265358979323846 * k / 12.0;
+                    double a1 = 2.0 * 3.14159265358979323846 * (k + 1) / 12.0;
+                    BPV(cx + nxr*0.5f*(float)cos(a0), cy + nyr*0.5f*(float)sin(a0), cr,cg,cb);
+                    BPV(cx + nxr*0.5f*(float)cos(a1), cy + nyr*0.5f*(float)sin(a1), cr,cg,cb);
+                }
+            } else if (i == JFA_BTN_X) {
+                BPV(cx-nxr*0.45f, cy-nyr*0.45f, cr,cg,cb);
+                BPV(cx+nxr*0.45f, cy+nyr*0.45f, cr,cg,cb);
+                BPV(cx+nxr*0.45f, cy-nyr*0.45f, cr,cg,cb);
+                BPV(cx-nxr*0.45f, cy+nyr*0.45f, cr,cg,cb);
+            }
+        }
+    }
+#undef BPV
+
+    if (n > (int)(sizeof(v) / sizeof(v[0])))
+        return;
+    ntri = 0;       /* all geometry here is drawn with GL_LINES */
+    static const float ident[16] = {
+        1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
+    };
+    glUseProgram(prog);
+    glUniformMatrix4fv(mvp, 1, GL_FALSE, ident);
+    glUniform1f(mode, 1.0f);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (size_t)n * sizeof(float), v, GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(pos);
+    glEnableVertexAttribArray(col);
+    glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)0);
+    glVertexAttribPointer(col, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
+                          (void *)(3 * sizeof(float)));
+    glDisable(GL_DEPTH_TEST);
+    glDrawArrays(GL_TRIANGLES, 0, ntri);
+    glDrawArrays(GL_LINES, ntri, n / 6 - ntri);
+    glEnable(GL_DEPTH_TEST);
+}
+
 /* ---- M3.1-A: one movement step (pure math, desktop-testable).
  * pos[0]/pos[1] are X/Z; Y is never touched (character stays grounded).
  * dt is clamped here so a long pause cannot teleport through a wall. */
@@ -566,7 +1016,7 @@ static void drawFPS(GLuint prog,GLuint vbo,GLint pos,GLint col,GLint mvp,GLint m
  glBindBuffer(GL_ARRAY_BUFFER,vbo);glBufferData(GL_ARRAY_BUFFER,n*sizeof(float),a,GL_DYNAMIC_DRAW);glEnableVertexAttribArray(pos);glEnableVertexAttribArray(col);glVertexAttribPointer(pos,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)0);glVertexAttribPointer(col,3,GL_FLOAT,GL_FALSE,6*sizeof(float),(void*)(3*sizeof(float)));glDrawArrays(GL_POINTS,0,n/6);glEnable(GL_DEPTH_TEST);
 }
 static GLuint createArenaFloor(float y) {
-    const float half = 8.0f;
+    const float half = 8.0f * JFA_ARENA_SCALE;
 
     const FloorVertex floorVertices[] = {
         {{-half, y, -half}, {0, 0}, {0, 1, 0}, {0.13f, 0.16f, 0.21f}},
@@ -764,6 +1214,10 @@ glGenBuffers(1, &meshVBO);
 glGenBuffers(1, &fpsVBO);
 GLuint dpadVBO = 0; /* M3.1-B: dedicated D-pad overlay VBO */
 glGenBuffers(1, &dpadVBO);
+GLuint attackVBO = 0; /* M3.2-A: temporary attack button overlay */
+glGenBuffers(1, &attackVBO);
+GLuint buttonsVBO = 0; /* M3.2-A: extra PSP-style controls */
+glGenBuffers(1, &buttonsVBO);
 
 if (fbxOK && frameMesh.vertex_count > 0) {
     groundY = frameMesh.vertices[0].position[1];
@@ -783,8 +1237,8 @@ if (characterHeight < 0.001f) characterHeight = 2.0f;
 GLuint arenaVBO = createArenaFloor(groundY - 0.02f);
 GLuint arenaWallsVBO = createArenaWalls(
     groundY - 0.02f,
-    characterHeight * 1.1f,
-    4.2f,
+    JFA_ARENA_HALF,                 /* cube-like wall height */
+    JFA_ARENA_HALF,
     characterHeight * 0.08f
 );
 
@@ -975,11 +1429,14 @@ SDL_Event e;
  * charFacing replaces the old static turntable angle ('angle'). ---- */
 static float charPos[2] = { 0.0f, 0.0f };
 static float charFacing = 0.0f;
+static JFAButtons extraButtons;
 static Uint64 moveLastCounter = 0;
 static int moveTimeValid = 0;
 /* M3.1-B: one finger per D-pad button. Touch hit testing uses WINDOW
  * coordinates (SDL_GetWindowSize); rendering keeps drawable pixels. */
 static JFADpad dpad = { { -1, -1, -1, -1 } };
+static JFAAttack attack = { 0, 0.0, 0.0, -1 };
+static int attackKeyPrev = 0;
 static int inputW = 1080, inputH = 1920;
 
 Uint64 start = SDL_GetPerformanceCounter();
@@ -987,6 +1444,7 @@ Uint64 animationStart = SDL_GetPerformanceCounter();
 
 int frames = 0, fps = 0;
 double freq = (double)SDL_GetPerformanceFrequency();
+jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
  while(run){
   {
     /* SDL finger coordinates are normalized over the WINDOW; keep
@@ -1002,22 +1460,46 @@ double freq = (double)SDL_GetPerformanceFrequency();
     if (e.type == SDL_QUIT || e.type == SDL_APP_TERMINATING) {
         run = 0;
         jfa_dpad_reset(&dpad);
+        jfa_attack_reset(&attack);
+        jfa_buttons_reset(&extraButtons);
     } else if (e.type == SDL_APP_WILLENTERBACKGROUND ||
                e.type == SDL_APP_DIDENTERBACKGROUND) {
         /* No FINGERUP is guaranteed when Android backgrounds us. */
         jfa_dpad_reset(&dpad);
+        jfa_attack_reset(&attack);
+        jfa_buttons_reset(&extraButtons);
     }
 #if defined(SDL_FINGERCANCELLED)
     else if (e.type == SDL_FINGERCANCELLED) {
-        jfa_dpad_reset(&dpad);
+        /* Cancellation is per-finger: release only what that finger owns. */
+        jfa_dpad_cancel(&dpad, e.tfinger.fingerId);
+        jfa_attack_release(&attack, e.tfinger.fingerId);
+        jfa_buttons_up(&extraButtons, e.tfinger.fingerId);
     }
 #endif
     else if (e.type == SDL_FINGERDOWN) {
+        /* Bottom-right attack button is disjoint from the analogue circle,
+         * so a second finger can independently control movement. */
+        if (jfa_attack_hit(e.tfinger.x, e.tfinger.y, inputW, inputH)) {
+            double now = (SDL_GetPerformanceCounter() - animationStart) / freq;
+            if (jfa_attack_trigger(&attack, now, now - jfaClipStart,
+                                   e.tfinger.fingerId))
+                SDL_Log("JFA attack: finger=%lld clip=%s",
+                        (long long)e.tfinger.fingerId,
+                        jfa_clip_suffix[JFA_ATTACK_CLIP]);
+        }
+        /* Visual-only PSP-style buttons: independent ownership, no gameplay. */
+        else if (jfa_buttons_find(e.tfinger.x, e.tfinger.y,
+                                  inputW, inputH) >= 0) {
+            int btn = jfa_buttons_find(e.tfinger.x, e.tfinger.y,
+                                       inputW, inputH);
+            jfa_buttons_down(&extraButtons, btn, e.tfinger.fingerId);
+        }
         /* First touch inside the analogue circle claims continuous
          * control; others fall through to the existing digital path. */
-        if (!jfa_dpad_analog_apply(&dpad, e.tfinger.fingerId,
-                                   e.tfinger.x, e.tfinger.y,
-                                   inputW, inputH))
+        else if (!jfa_dpad_analog_apply(&dpad, e.tfinger.fingerId,
+                                        e.tfinger.x, e.tfinger.y,
+                                        inputW, inputH))
             jfa_dpad_down(&dpad, e.tfinger.fingerId,
                           e.tfinger.x, e.tfinger.y, inputW, inputH);
         JFA_DPAD_LOG(win, "DOWN", e.tfinger.fingerId,
@@ -1025,6 +1507,14 @@ double freq = (double)SDL_GetPerformanceFrequency();
                      jfa_dpad_visual_mask(&dpad));
     } else if (e.type == SDL_FINGERMOTION) {
         const unsigned before = jfa_dpad_visual_mask(&dpad);
+        /* A button owner that slides off its button is visually released. */
+        for (int bi = 0; bi < JFA_BTN_COUNT; bi++) {
+            if (extraButtons.finger[bi] == e.tfinger.fingerId) {
+                if (jfa_buttons_hit(bi, e.tfinger.x, e.tfinger.y,
+                                    inputW, inputH) != bi)
+                    extraButtons.finger[bi] = -1;
+            }
+        }
         if (dpad.analogFinger == e.tfinger.fingerId) {
             /* Leaving the circle stops movement but keeps ownership
              * until release; re-entering resumes continuous control. */
@@ -1044,6 +1534,9 @@ double freq = (double)SDL_GetPerformanceFrequency();
                          e.tfinger.x, e.tfinger.y, inputW, inputH, after);
     } else if (e.type == SDL_FINGERUP) {
         const unsigned before = jfa_dpad_visual_mask(&dpad);
+        /* Releasing the attack finger does not cut the clip short. */
+        jfa_attack_release(&attack, e.tfinger.fingerId);
+        jfa_buttons_up(&extraButtons, e.tfinger.fingerId);
         jfa_dpad_analog_release(&dpad, e.tfinger.fingerId);
         jfa_dpad_up(&dpad, e.tfinger.fingerId);
         if (before != jfa_dpad_visual_mask(&dpad))
@@ -1058,6 +1551,17 @@ double freq = (double)SDL_GetPerformanceFrequency();
   /* ---- M3.1-A: keyboard movement (WASD + arrows), development only ---- */
   {
     const Uint8 *keys = SDL_GetKeyboardState(NULL);
+    /* J triggers the same attack as the on-screen button (edge-triggered). */
+    {
+        int attackKey = keys[SDL_SCANCODE_J] ? 1 : 0;
+        if (attackKey && !attackKeyPrev) {
+            if (jfa_attack_trigger(&attack, animationTime,
+                                   animationTime - jfaClipStart, -1))
+                SDL_Log("JFA attack: key=J clip=%s",
+                        jfa_clip_suffix[JFA_ATTACK_CLIP]);
+        }
+        attackKeyPrev = attackKey;
+    }
     float dx = 0.0f, dz = 0.0f;
     if (keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT])  dx -= 1.0f;
     if (keys[SDL_SCANCODE_D] || keys[SDL_SCANCODE_RIGHT]) dx += 1.0f;
@@ -1076,11 +1580,11 @@ double freq = (double)SDL_GetPerformanceFrequency();
      * 1.15 body heights in front of the camera (near plane 0.2)
      * and no farther than 3 body heights away (still legible),
      * while never passing the arena's back wall. */
-    const float arenaHalf = 4.2f;
+    const float arenaHalf = JFA_ARENA_HALF;
     const float wallThickness = characterHeight * 0.08f;
     const float bodyRadius = 0.35f;
     const float xLimit = arenaHalf - wallThickness - bodyRadius;
-    const float sceneDist = 3.5f; /* |sceneTrans[14]| */
+    const float sceneDist = 3.85f; /* camera pulled back slightly for larger room */
     const float frontZ = sceneDist - characterHeight * 1.15f;
     float backZ = sceneDist - characterHeight * 3.0f;
     if (backZ < -xLimit) backZ = -xLimit;
@@ -1098,6 +1602,8 @@ double freq = (double)SDL_GetPerformanceFrequency();
         dx += dpad.analogX;
         dz += dpad.analogY;
     }
+    lastMoveDx = dx;
+    lastMoveDz = dz;
     jfa_move_step(charPos, &charFacing, dx, dz, dt,
                   xLimit, backZ, frontZ);
   }
@@ -1114,8 +1620,13 @@ if (!jfaOK) {
   if(tex && (jfaOK || (fbxOK && frameMesh.vertex_count > 0))){
    float c=cosf(charFacing),s=sinf(charFacing);
    /* Fixed scene transform (also used for arena) is kept separate
-    * from the character translation so the arena never moves. */
-   float sceneTrans[16]={1,0,0,0,0,1,0,0,0,0,1,0,0,-1.1f,-3.5f,1};
+    * from the character translation so the arena never moves. A small
+    * +X pitch tilts the world up, i.e. the camera looks slightly down. */
+   float cp = cosf(JFA_CAMERA_PITCH), sp = sinf(JFA_CAMERA_PITCH);
+   float sceneRot[16] = {1,0,0,0, 0,cp,sp,0, 0,-sp,cp,0, 0,0,0,1};
+   float sceneMove[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,JFA_CAMERA_Y,JFA_CAMERA_Z,1};
+   float sceneTrans[16];
+   mm(sceneTrans, sceneMove, sceneRot);
    float charTrans[16]={1,0,0,0,0,1,0,0,0,0,1,0,charPos[0],0.0f,charPos[1],1};
    float model[16]={c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1};
    float charScene[16],vm[16],pr[16]={0},mvp[16];
@@ -1182,24 +1693,20 @@ glVertexAttrib3f(col, 1.0f, 1.0f, 1.0f);
 
 size_t drawCount = 0;
 const JFAClip *jfaCur = NULL;
+int sampleClip = jfaClip;   /* clip actually sampled this frame (attack or locomotion) */
 int af = 0;
 const float worldPos[3] = { 0.0f, 0.0f, 0.0f };
 if (jfaOK) {
-    /* ---- Animation advance (shared by CPU and GPU paths): the
-     * clip cycle and sampled frame are computed identically for
-     * both render paths - timing never depends on which one draws. ---- */
-    jfaCur = &jfa.clips[jfaClip];
+    /* ---- Animation advance (shared by CPU and GPU paths): the attack
+     * state overrides the clip/frame, otherwise locomotion auto-cycles.
+     * Both render paths consume sampleClip/af computed exactly here. ---- */
+    JFAAnimSample sample = jfa_anim_select(&attack, animationTime,
+                                           &jfaClip, &jfaClipStart,
+                                           jfa.clips, lastMoveDx, lastMoveDz);
+    sampleClip = sample.clip;
+    jfaCur = &jfa.clips[sampleClip];
     jfaClipDur = (double)jfaCur->frames / (double)jfaCur->fps;
-    if (animationTime - jfaClipStart >= jfaClipDur) {
-        jfaClip = (jfaClip + 1) % JFA_CLIP_COUNT;
-        jfaClipStart = animationTime;
-        jfaCur = &jfa.clips[jfaClip];
-        jfaClipDur = (double)jfaCur->frames / (double)jfaCur->fps;
-        SDL_Log("JFA clip: %s (%d frames @ %u fps)",
-            jfa_clip_suffix[jfaClip], jfaCur->frames,
-            (unsigned)jfaCur->fps);
-    }
-    af = jfa_skin_frame_index(jfaCur, animationTime - jfaClipStart);
+    af = jfa_skin_frame_index(jfaCur, sample.time);
 }
 #if JFA_GPU_SKIN && JFA_GPU_RENDER
 int gpuDraw = 0;
@@ -1213,7 +1720,7 @@ if (jfaOK && jfaGpuRenderReady) {
      * misattributed. */
     while (glGetError() != GL_NO_ERROR) {
     }
-    jfa_gpu_fold(&jfa, jfaClip, af, jfaScale, jfaCenter, worldPos,
+    jfa_gpu_fold(&jfa, sampleClip, af, jfaScale, jfaCenter, worldPos,
         jfaBoneStage);
     glUseProgram(jfaGpuProg);
     glUniformMatrix4fv(jfaGpuMvpLoc, 1, GL_FALSE, mvp);
@@ -1274,7 +1781,7 @@ if (jfaOK && jfaGpuRenderReady) {
 if (jfaOK) {
     /* ---- JFA: CPU skin the current clip frame, then one sub-data upload ---- */
     Uint64 tSkin0 = SDL_GetPerformanceCounter();
-    jfa_skin_frame(&jfa, jfaClip, af, jfaScale, jfaCenter, worldPos,
+    jfa_skin_frame(&jfa, sampleClip, af, jfaScale, jfaCenter, worldPos,
         &jfaSkin);
     Uint64 tSkin1 = SDL_GetPerformanceCounter();
 
@@ -1306,7 +1813,7 @@ if (jfaOK) {
      * the fold + upload itself. */
     if (jfaGpuOK) {
         Uint64 tFold0 = SDL_GetPerformanceCounter();
-        jfa_gpu_fold(&jfa, jfaClip, af, jfaScale, jfaCenter, worldPos,
+        jfa_gpu_fold(&jfa, sampleClip, af, jfaScale, jfaCenter, worldPos,
             jfaBoneStage);
         glUseProgram(jfaGpuProg);
         glUniform4fv(jfaGpuBoneLoc, jfa.nb * 3, jfaBoneStage);
@@ -1356,11 +1863,17 @@ glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
   jfa_dpad_visual_levels(&dpad, levels);
   jfa_dpad_draw(prog, dpadVBO, pos, col, mvpLoc, modeLoc,
                 inputW, inputH, levels); /* overlay only; character path untouched */
+  jfa_attack_draw(prog, attackVBO, pos, col, mvpLoc, modeLoc,
+                  inputW, inputH, attack.active);
+  jfa_buttons_draw(prog, buttonsVBO, pos, col, mvpLoc, modeLoc,
+                   inputW, inputH, &extraButtons);
   SDL_GL_SwapWindow(win);
  }
  glDeleteBuffers(1, &meshVBO);
 glDeleteBuffers(1, &fpsVBO);
 glDeleteBuffers(1, &dpadVBO);
+glDeleteBuffers(1, &attackVBO);
+glDeleteBuffers(1, &buttonsVBO);
 glDeleteBuffers(1, &arenaVBO);
 glDeleteBuffers(1, &arenaWallsVBO);
 if (tex)
