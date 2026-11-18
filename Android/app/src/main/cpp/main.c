@@ -128,21 +128,16 @@ typedef struct {
     SDL_FingerID finger[4]; /* -1 = unused; index 0=UP,1=DOWN,2=LEFT,3=RIGHT */
 } JFADpad;
 
-static int jfa_dpad_index(int bit)
-{
-    if (bit == JFA_DIR_UP) return 0;
-    if (bit == JFA_DIR_DOWN) return 1;
-    if (bit == JFA_DIR_LEFT) return 2;
-    return 3;
-}
-
 static void jfa_dpad_reset(JFADpad *d)
 {
     for (int i = 0; i < 4; i++)
         d->finger[i] = -1;
 }
 
-/* Returns the button bit under a normalized touch, or 0 (no button). */
+/* Returns the direction mask under a normalized touch: one button bit,
+ * UP|LEFT / UP|RIGHT / DOWN|LEFT / DOWN|RIGHT in a diagonal corner gap,
+ * or 0 (neutral). Buttons are checked first and gaps use strict bounds,
+ * so no coordinate belongs to two regions. */
 static int jfa_dpad_hit(float nx, float ny, int vw, int vh)
 {
     JFADpadGeom g;
@@ -159,41 +154,74 @@ static int jfa_dpad_hit(float nx, float ny, int vw, int vh)
         if (fabsf(nx - bx) <= g.hx && fabsf(ny - by) <= g.hy)
             return bits[i];
     }
+    /* The four diagonal corner gaps are the squares between adjacent
+     * button rects, (gx-2*hx) x (gy-2*hy) pixels in size. */
+    if (nx > g.cx - g.gx + g.hx && nx < g.cx - g.hx &&
+        ny > g.cy - g.gy + g.hy && ny < g.cy - g.hy)
+        return JFA_DIR_UP | JFA_DIR_LEFT;
+    if (nx > g.cx + g.hx && nx < g.cx + g.gx - g.hx &&
+        ny > g.cy - g.gy + g.hy && ny < g.cy - g.hy)
+        return JFA_DIR_UP | JFA_DIR_RIGHT;
+    if (nx > g.cx - g.gx + g.hx && nx < g.cx - g.hx &&
+        ny > g.cy + g.hy && ny < g.cy + g.gy - g.hy)
+        return JFA_DIR_DOWN | JFA_DIR_LEFT;
+    if (nx > g.cx + g.hx && nx < g.cx + g.gx - g.hx &&
+        ny > g.cy + g.hy && ny < g.cy + g.gy - g.hy)
+        return JFA_DIR_DOWN | JFA_DIR_RIGHT;
     return 0;
+}
+
+/* Apply a direction mask to one finger atomically: every requested slot
+ * must be free or already owned by this finger; otherwise nothing changes
+ * (never steal, never partially assign). On success this finger's old
+ * slots are released before the new mask is assigned. */
+static int jfa_dpad_assign(JFADpad *d, SDL_FingerID id, int mask)
+{
+    for (int i = 0; i < 4; i++) {
+        if (!(mask & (1 << i)))
+            continue;
+        if (d->finger[i] >= 0 && d->finger[i] != id)
+            return 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (d->finger[i] == id)
+            d->finger[i] = -1;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (mask & (1 << i))
+            d->finger[i] = id;
+    }
+    return 1;
 }
 
 static void jfa_dpad_down(JFADpad *d, SDL_FingerID id,
                           float nx, float ny, int vw, int vh)
 {
-    int bit = jfa_dpad_hit(nx, ny, vw, vh);
-    if (bit) {
-        int i = jfa_dpad_index(bit);
-        if (d->finger[i] < 0)
-            d->finger[i] = id;
-    }
+    int mask = jfa_dpad_hit(nx, ny, vw, vh);
+    if (mask)
+        jfa_dpad_assign(d, id, mask);
 }
 
 static void jfa_dpad_motion(JFADpad *d, SDL_FingerID id,
                             float nx, float ny, int vw, int vh)
 {
-    int dest = jfa_dpad_hit(nx, ny, vw, vh);
+    int owned = 0;
+    /* A finger that never grabbed a direction must not acquire one by
+     * merely sliding over the D-pad. */
     for (int i = 0; i < 4; i++) {
-        int j;
-        if (d->finger[i] != id)
-            continue;
-        /* Sliding through a GAP must NOT drop finger ownership: keep
-         * the current direction until another button is entered. */
-        if (dest == 0 || dest == (1 << i))
-            return;
-        j = jfa_dpad_index(dest);
-        /* Never steal a button already held by a different finger;
-         * in that case keep the old direction until release. */
-        if (d->finger[j] < 0 || j == i) {
-            d->finger[i] = -1;
-            d->finger[j] = id;
-        }
-        return;
+        if (d->finger[i] == id) { owned = 1; break; }
     }
+    if (!owned)
+        return;
+    int dest = jfa_dpad_hit(nx, ny, vw, vh);
+    /* Sliding through a NEUTRAL gap must NOT drop finger ownership:
+     * keep the current direction until another button/gap is entered. */
+    if (dest == 0)
+        return;
+    /* jfa_dpad_assign() keeps the old direction if any requested slot is
+     * held by another finger, and otherwise moves all of this finger's
+     * slots to the new mask (single button or diagonal pair). */
+    jfa_dpad_assign(d, id, dest);
 }
 
 static void jfa_dpad_up(JFADpad *d, SDL_FingerID id)
@@ -364,6 +392,9 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
 /* ---- M3.1-A: one movement step (pure math, desktop-testable).
  * pos[0]/pos[1] are X/Z; Y is never touched (character stays grounded).
  * dt is clamped here so a long pause cannot teleport through a wall. */
+#define JFA_TURN_RATE 9.0f /* radians/second; smooth yaw toward input */
+#define JFA_PI 3.14159265358979323846f
+#define JFA_TWO_PI 6.28318530717958647692f
 static void jfa_move_step(float pos[2], float *facing, float dx, float dz,
                           double dt, float xLimit, float zBack,
                           float zFront)
@@ -375,9 +406,20 @@ static void jfa_move_step(float pos[2], float *facing, float dx, float dz,
  if (dt > 0.05) dt = 0.05;
  len = sqrtf(dx * dx + dz * dz);
  if (len > 0.0f) {
+     float target, diff, maxStep;
      dx /= len;
      dz /= len;              /* diagonal is not faster than straight */
-     *facing = atan2f(dx, dz);
+     target = atan2f(dx, dz);
+     /* Shortest signed arc, correct across the -PI/PI seam. */
+     diff = atan2f(sinf(target - *facing), cosf(target - *facing));
+     maxStep = JFA_TURN_RATE * (float)dt;
+     if (diff > maxStep) diff = maxStep;
+     if (diff < -maxStep) diff = -maxStep;
+     *facing += diff;
+     /* Wrap into [-PI, PI] without unbounded accumulation. */
+     *facing = fmodf(*facing + JFA_PI, JFA_TWO_PI);
+     if (*facing < 0.0f) *facing += JFA_TWO_PI;
+     *facing -= JFA_PI;
      pos[0] += dx * speed * (float)dt;
      pos[1] += dz * speed * (float)dt;
  }
