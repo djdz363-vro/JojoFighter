@@ -365,12 +365,8 @@ static void jfa_dpad_visual_levels(const JFADpad *d, float out[4])
 #define JFA_CAMERA_Z (-3.85f)
 #define JFA_CAMERA_PITCH 0.055f
 
-/* ---- M3.2-A: first basic attack. One named clip, one independent touch
- * owner, and a pure clip-selection helper shared by CPU/GPU paths. ---- */
-#define JFA_ATTACK_CLIP JFA_PUNCH_RIGHT
-#define JFA_ATTACK_NX 0.62f   /* clear of D-pad and every PSP-style control */
-#define JFA_ATTACK_NY 0.58f
-#define JFA_ATTACK_RADIUS 0.65f   /* fraction of s (button size) */
+/* ---- M3.2-B: multiple basic attacks. The selected animation clip lives
+ * in the attack state; CPU and GPU share one sampled clip/frame. ---- */
 
 /* Locomotion is explicit: IDLE when stationary, WALK forward/lateral,
  * BACKWALK backward. GUARD and all attack/reaction clips are reserved for
@@ -386,6 +382,7 @@ static int jfa_locomotion_clip_for(float dx, float dz)
 
 typedef struct {
     int active;              /* 1 while the attack clip is playing */
+    int clip;                /* selected attack clip index */
     double start;            /* animationTime when triggered */
     double savedElapsed;     /* locomotion elapsed time to restore */
     SDL_FingerID finger;     /* owner touch, -1 for keyboard */
@@ -397,11 +394,13 @@ typedef struct {
 } JFAAnimSample;
 
 static int jfa_attack_trigger(JFAAttack *a, double now,
-                              double locoElapsed, SDL_FingerID finger)
+                              double locoElapsed, SDL_FingerID finger,
+                              int clip)
 {
     if (a->active)
-        return 0;            /* no interruption of an active attack */
+        return 0;            /* no interruption and no queue */
     a->active = 1;
+    a->clip = clip;
     a->start = now;
     a->savedElapsed = locoElapsed;
     a->finger = finger;
@@ -419,6 +418,7 @@ static void jfa_attack_release(JFAAttack *a, SDL_FingerID finger)
 static void jfa_attack_reset(JFAAttack *a)
 {
     a->active = 0;
+    a->clip = JFA_IDLE;
     a->start = 0.0;
     a->savedElapsed = 0.0;
     a->finger = -1;
@@ -434,11 +434,11 @@ static JFAAnimSample jfa_anim_select(JFAAttack *a, double now,
     JFAAnimSample s;
 
     if (a->active) {
-        const JFAClip *ac = &clips[JFA_ATTACK_CLIP];
+        const JFAClip *ac = &clips[a->clip];
         double dur = (double)ac->frames / (double)ac->fps;
         double t = now - a->start;
         if (t < dur) {
-            s.clip = JFA_ATTACK_CLIP;
+            s.clip = a->clip;
             s.time = t;
             return s;
         }
@@ -468,23 +468,6 @@ static JFAAnimSample jfa_anim_select(JFAAttack *a, double now,
         s.time = elapsed;
     }
     return s;
-}
-
-/* Bottom-right attack zone. Radius is in window pixels, so it stays clear
- * of the bottom-left analogue circle at every supported resolution. */
-static int jfa_attack_hit(float nx, float ny, int vw, int vh)
-{
-    JFADpadGeom g;
-    float halfPx, rpx, dx, dy;
-
-    if (vw < 1 || vh < 1)
-        return 0;
-    jfa_dpad_geom(vw, vh, &g);
-    halfPx = g.hx * (float)vw;              /* s/2 in pixels */
-    rpx = JFA_ATTACK_RADIUS * halfPx;
-    dx = (nx - JFA_ATTACK_NX) * (float)vw;
-    dy = (ny - JFA_ATTACK_NY) * (float)vh;
-    return (dx * dx + dy * dy <= rpx * rpx);
 }
 
 /* ---- M3.2-A: extra PSP-style controls (visual/input only, no gameplay).
@@ -583,6 +566,38 @@ static void jfa_buttons_up(JFAButtons *b, SDL_FingerID finger)
     for (int i = 0; i < JFA_BTN_COUNT; i++)
         if (b->finger[i] == finger)
             b->finger[i] = -1;
+}
+
+/* M3.2-B: face buttons that trigger attacks. CIRCLE stays visual-only. */
+static int jfa_attack_clip_for_button(int btn)
+{
+    if (btn == JFA_BTN_TRI)    return JFA_PUNCH_RIGHT;
+    if (btn == JFA_BTN_SQUARE) return JFA_PUNCH_LEFT;
+    if (btn == JFA_BTN_X)      return JFA_KICK;
+    return -1;
+}
+
+static int jfa_attack_clip_for_key(int index)
+{
+    static const int clips[3] = { JFA_PUNCH_RIGHT, JFA_PUNCH_LEFT, JFA_KICK };
+    return (index >= 0 && index < 3) ? clips[index] : -1;
+}
+
+/* An attack may only start after this finger successfully claims the
+ * button. A failed claim leaves button ownership and attack state alone.
+ * Returns 1 only when a new attack was accepted. */
+static int jfa_face_button_press(JFAButtons *buttons, JFAAttack *attack,
+                                 int btn, SDL_FingerID finger,
+                                 double now, double locoElapsed)
+{
+    int clip;
+
+    if (!jfa_buttons_down(buttons, btn, finger))
+        return 0;
+    clip = jfa_attack_clip_for_button(btn);
+    if (clip < 0)
+        return 0;
+    return jfa_attack_trigger(attack, now, locoElapsed, finger, clip);
 }
 
 /* TEMPORARY device diagnostics: shows raw SDL finger coordinates, the
@@ -720,83 +735,6 @@ static void jfa_dpad_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
     glEnable(GL_DEPTH_TEST);
 }
 
-/* M3.2-A: temporary attack button, drawn with the same flat-color path.
- * Own VBO/geometry: the verified D-pad overlay is not touched. */
-static void jfa_attack_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
-                            GLint mvp, GLint mode, int w, int h, int active)
-{
-    float v[1024];
-    int n = 0, ntri, k;
-    const int seg = 24;
-    JFADpadGeom g;
-    float cx, cy, rnx, rny;
-
-    if (w < 1 || h < 1)
-        return;
-    jfa_dpad_geom(w, h, &g);
-    cx = JFA_ATTACK_NX;
-    cy = JFA_ATTACK_NY;
-    /* Same radius definition as jfa_attack_hit(); circular in pixels. */
-    rnx = JFA_ATTACK_RADIUS * g.hx;
-    rny = JFA_ATTACK_RADIUS * g.hy;
-
-#define ADPV(px_, py_, r_, g_, b_) do { \
-    float x_ = (px_), y_ = (py_); \
-    if (x_ < 0.0f) { x_ = 0.0f; } \
-    if (x_ > 1.0f) { x_ = 1.0f; } \
-    if (y_ < 0.0f) { y_ = 0.0f; } \
-    if (y_ > 1.0f) { y_ = 1.0f; } \
-    v[n++] = 2.0f * x_ - 1.0f; \
-    v[n++] = 1.0f - 2.0f * y_; \
-    v[n++] = 0.0f; v[n++] = r_; v[n++] = g_; v[n++] = b_; \
-} while (0)
-
-    {
-        const float fr = active ? 0.38f : 0.16f;
-        const float fg = active ? 0.36f : 0.17f;
-        const float fb = active ? 0.24f : 0.20f;
-        for (k = 0; k < seg; k++) {
-            double a0 = 2.0 * 3.14159265358979323846 * k / seg;
-            double a1 = 2.0 * 3.14159265358979323846 * (k + 1) / seg;
-            ADPV(cx, cy, fr, fg, fb);
-            ADPV(cx + rnx * (float)cos(a0), cy + rny * (float)sin(a0), fr, fg, fb);
-            ADPV(cx + rnx * (float)cos(a1), cy + rny * (float)sin(a1), fr, fg, fb);
-        }
-    }
-    ntri = n / 6;
-    {
-        const float lr = active ? 1.00f : 0.66f;
-        const float lg = active ? 0.90f : 0.69f;
-        const float lb = active ? 0.50f : 0.74f;
-        for (k = 0; k < seg; k++) {
-            double a0 = 2.0 * 3.14159265358979323846 * k / seg;
-            double a1 = 2.0 * 3.14159265358979323846 * (k + 1) / seg;
-            ADPV(cx + rnx * (float)cos(a0), cy + rny * (float)sin(a0), lr, lg, lb);
-            ADPV(cx + rnx * (float)cos(a1), cy + rny * (float)sin(a1), lr, lg, lb);
-        }
-    }
-#undef ADPV
-
-    if (n > (int)(sizeof(v) / sizeof(v[0])))
-        return;
-    static const float ident[16] = {
-        1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
-    };
-    glUseProgram(prog);
-    glUniformMatrix4fv(mvp, 1, GL_FALSE, ident);
-    glUniform1f(mode, 1.0f);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, (size_t)n * sizeof(float), v, GL_DYNAMIC_DRAW);
-    glEnableVertexAttribArray(pos);
-    glEnableVertexAttribArray(col);
-    glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)0);
-    glVertexAttribPointer(col, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float),
-                          (void *)(3 * sizeof(float)));
-    glDisable(GL_DEPTH_TEST);
-    glDrawArrays(GL_TRIANGLES, 0, ntri);
-    glDrawArrays(GL_LINES, ntri, n / 6 - ntri);
-    glEnable(GL_DEPTH_TEST);
-}
 
 /* M3.2-A: draw the extra PSP-style controls. Separate VBO; game logic is
  * untouched and press state only changes highlight colors. */
@@ -1214,8 +1152,6 @@ glGenBuffers(1, &meshVBO);
 glGenBuffers(1, &fpsVBO);
 GLuint dpadVBO = 0; /* M3.1-B: dedicated D-pad overlay VBO */
 glGenBuffers(1, &dpadVBO);
-GLuint attackVBO = 0; /* M3.2-A: temporary attack button overlay */
-glGenBuffers(1, &attackVBO);
 GLuint buttonsVBO = 0; /* M3.2-A: extra PSP-style controls */
 glGenBuffers(1, &buttonsVBO);
 
@@ -1435,8 +1371,8 @@ static int moveTimeValid = 0;
 /* M3.1-B: one finger per D-pad button. Touch hit testing uses WINDOW
  * coordinates (SDL_GetWindowSize); rendering keeps drawable pixels. */
 static JFADpad dpad = { { -1, -1, -1, -1 } };
-static JFAAttack attack = { 0, 0.0, 0.0, -1 };
-static int attackKeyPrev = 0;
+static JFAAttack attack = { 0, JFA_IDLE, 0.0, 0.0, -1 };
+static int attackKeyPrev[3] = { 0, 0, 0 };  /* J/K/L edge tracking */
 static int inputW = 1080, inputH = 1920;
 
 Uint64 start = SDL_GetPerformanceCounter();
@@ -1478,22 +1414,18 @@ jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
     }
 #endif
     else if (e.type == SDL_FINGERDOWN) {
-        /* Bottom-right attack button is disjoint from the analogue circle,
-         * so a second finger can independently control movement. */
-        if (jfa_attack_hit(e.tfinger.x, e.tfinger.y, inputW, inputH)) {
+        /* PSP-style buttons keep independent finger ownership. Triangle,
+         * Square and X also trigger attacks; Circle stays visual-only. */
+        int btn = jfa_buttons_find(e.tfinger.x, e.tfinger.y,
+                                   inputW, inputH);
+        if (btn >= 0) {
             double now = (SDL_GetPerformanceCounter() - animationStart) / freq;
-            if (jfa_attack_trigger(&attack, now, now - jfaClipStart,
-                                   e.tfinger.fingerId))
+            if (jfa_face_button_press(&extraButtons, &attack, btn,
+                                      e.tfinger.fingerId, now,
+                                      now - jfaClipStart))
                 SDL_Log("JFA attack: finger=%lld clip=%s",
                         (long long)e.tfinger.fingerId,
-                        jfa_clip_suffix[JFA_ATTACK_CLIP]);
-        }
-        /* Visual-only PSP-style buttons: independent ownership, no gameplay. */
-        else if (jfa_buttons_find(e.tfinger.x, e.tfinger.y,
-                                  inputW, inputH) >= 0) {
-            int btn = jfa_buttons_find(e.tfinger.x, e.tfinger.y,
-                                       inputW, inputH);
-            jfa_buttons_down(&extraButtons, btn, e.tfinger.fingerId);
+                        jfa_clip_suffix[jfa_attack_clip_for_button(btn)]);
         }
         /* First touch inside the analogue circle claims continuous
          * control; others fall through to the existing digital path. */
@@ -1551,16 +1483,24 @@ jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
   /* ---- M3.1-A: keyboard movement (WASD + arrows), development only ---- */
   {
     const Uint8 *keys = SDL_GetKeyboardState(NULL);
-    /* J triggers the same attack as the on-screen button (edge-triggered). */
+    /* Desktop aliases: J = PUNCH_RIGHT, K = PUNCH_LEFT, L = KICK.
+     * Edge-triggered and routed through the same no-queue attack state. */
     {
-        int attackKey = keys[SDL_SCANCODE_J] ? 1 : 0;
-        if (attackKey && !attackKeyPrev) {
-            if (jfa_attack_trigger(&attack, animationTime,
-                                   animationTime - jfaClipStart, -1))
-                SDL_Log("JFA attack: key=J clip=%s",
-                        jfa_clip_suffix[JFA_ATTACK_CLIP]);
+        static const int keyScancode[3] = {
+            SDL_SCANCODE_J, SDL_SCANCODE_K, SDL_SCANCODE_L
+        };
+        for (int ki = 0; ki < 3; ki++) {
+            int clip = jfa_attack_clip_for_key(ki);
+            int down = keys[keyScancode[ki]] ? 1 : 0;
+            if (down && !attackKeyPrev[ki]) {
+                if (jfa_attack_trigger(&attack, animationTime,
+                                       animationTime - jfaClipStart, -1,
+                                       clip))
+                    SDL_Log("JFA attack: key=%d clip=%s", ki,
+                            jfa_clip_suffix[clip]);
+            }
+            attackKeyPrev[ki] = down;
         }
-        attackKeyPrev = attackKey;
     }
     float dx = 0.0f, dz = 0.0f;
     if (keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_LEFT])  dx -= 1.0f;
@@ -1863,8 +1803,6 @@ glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
   jfa_dpad_visual_levels(&dpad, levels);
   jfa_dpad_draw(prog, dpadVBO, pos, col, mvpLoc, modeLoc,
                 inputW, inputH, levels); /* overlay only; character path untouched */
-  jfa_attack_draw(prog, attackVBO, pos, col, mvpLoc, modeLoc,
-                  inputW, inputH, attack.active);
   jfa_buttons_draw(prog, buttonsVBO, pos, col, mvpLoc, modeLoc,
                    inputW, inputH, &extraButtons);
   SDL_GL_SwapWindow(win);
@@ -1872,7 +1810,6 @@ glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
  glDeleteBuffers(1, &meshVBO);
 glDeleteBuffers(1, &fpsVBO);
 glDeleteBuffers(1, &dpadVBO);
-glDeleteBuffers(1, &attackVBO);
 glDeleteBuffers(1, &buttonsVBO);
 glDeleteBuffers(1, &arenaVBO);
 glDeleteBuffers(1, &arenaWallsVBO);
