@@ -14,12 +14,8 @@
 /* reuses these buffers - no allocation in the render loop.            */
 /* ------------------------------------------------------------------ */
 static JFACharacter jfa;
-static JFASkinned jfaSkin;
+static JFASkinned jfaSkin[2];   /* one CPU-skinned output buffer per fighter */
 static int jfaOK = 0;
-static int jfaClip = JFA_IDLE;
-static double jfaClipStart = 0.0;   /* animationTime when clip began */
-static double jfaClipDur = 0.0;     /* seconds of the current clip */
-static float lastMoveDx = 0.0f, lastMoveDz = 0.0f; /* locomotion clip selection */
 static float jfaScale = 1.0f;
 static float jfaCenter[3] = { 0, 0, 0 };
 /* PERF accumulators (like fbx_loader.c): averaged over 60 frames. */
@@ -364,6 +360,9 @@ static void jfa_dpad_visual_levels(const JFADpad *d, float out[4])
 #define JFA_CAMERA_Y (-1.28f)
 #define JFA_CAMERA_Z (-3.85f)
 #define JFA_CAMERA_PITCH 0.055f
+/* Minimum center-to-center distance between fighters on the ground (X/Z).
+ * Keep it clear of the arena walls: the opponent spawns well inside them. */
+#define JFA_FIGHTER_SEPARATION 0.7f
 
 /* ---- M3.2-B: multiple basic attacks. The selected animation clip lives
  * in the attack state; CPU and GPU share one sampled clip/frame. ---- */
@@ -383,6 +382,7 @@ static int jfa_locomotion_clip_for(float dx, float dz)
 typedef struct {
     int active;              /* 1 while the attack clip is playing */
     int clip;                /* selected attack clip index */
+    int hitApplied;          /* 1 once this activation dealt damage */
     double start;            /* animationTime when triggered */
     double savedElapsed;     /* locomotion elapsed time to restore */
     SDL_FingerID finger;     /* owner touch, -1 for keyboard */
@@ -393,6 +393,78 @@ typedef struct {
     double time;             /* seconds into that clip */
 } JFAAnimSample;
 
+/* ---- M3.3 Stage 1: health and damage foundation. Plain C state only;
+ * no OpenGL, rendering, skinning, AI, hit detection or UI is involved. ---- */
+#define JFA_MAX_HEALTH 100
+
+typedef struct {
+    int health;              /* current health, 0..maxHealth */
+    int maxHealth;           /* maximum health for this fighter */
+} JFAHealth;
+
+int jfa_health_valid(const JFAHealth *h)
+{
+    return h != NULL && h->maxHealth > 0 &&
+           h->health >= 0 && h->health <= h->maxHealth;
+}
+
+void jfa_health_init(JFAHealth *h)
+{
+    if (!h)
+        return;
+    h->maxHealth = JFA_MAX_HEALTH;
+    h->health = JFA_MAX_HEALTH;
+}
+
+void jfa_health_reset(JFAHealth *h)
+{
+    jfa_health_init(h);
+}
+
+int jfa_health_apply_damage(JFAHealth *h, int amount)
+{
+    if (!jfa_health_valid(h) || amount <= 0)
+        return 0;
+    if (amount >= h->health) {
+        h->health = 0;
+        return 1;
+    }
+    h->health -= amount;
+    return 1;
+}
+
+int jfa_health_defeated(const JFAHealth *h)
+{
+    return jfa_health_valid(h) && h->health == 0;
+}
+
+/* A single attack activation may damage a target at most once. Invalid
+ * damage is rejected without consuming the one-hit allowance. */
+int jfa_attack_try_damage(JFAAttack *a, JFAHealth *target, int amount)
+{
+    if (!a || !a->active || a->hitApplied)
+        return 0;
+    if (!jfa_health_valid(target) || amount <= 0)
+        return 0;
+    a->hitApplied = 1;
+    return jfa_health_apply_damage(target, amount);
+}
+
+/* M3.3 Stage 2: per-fighter state. Fighter 0 is the player (existing
+ * controls); fighter 1 is the new idle opponent. Mesh/skeleton/clip data
+ * in jfa remains shared and immutable. */
+typedef struct {
+    float pos[2];              /* X/Z world position */
+    float facing;              /* smoothed yaw */
+    int clip;                  /* current locomotion clip */
+    double clipStart;          /* animationTime when clip began */
+    double clipDur;            /* seconds of current clip */
+    float moveDx, moveDz;      /* last movement input for animation */
+    JFAAnimSample sample;      /* clip/frame selected this frame */
+    JFAHealth health;          /* Stage 1 health, independent per fighter */
+    JFAAttack attack;          /* player uses it; opponent starts inactive */
+} JFAFighter;
+
 static int jfa_attack_trigger(JFAAttack *a, double now,
                               double locoElapsed, SDL_FingerID finger,
                               int clip)
@@ -401,6 +473,7 @@ static int jfa_attack_trigger(JFAAttack *a, double now,
         return 0;            /* no interruption and no queue */
     a->active = 1;
     a->clip = clip;
+    a->hitApplied = 0;       /* new activation allows one damage application */
     a->start = now;
     a->savedElapsed = locoElapsed;
     a->finger = finger;
@@ -419,6 +492,7 @@ static void jfa_attack_reset(JFAAttack *a)
 {
     a->active = 0;
     a->clip = JFA_IDLE;
+    a->hitApplied = 0;
     a->start = 0.0;
     a->savedElapsed = 0.0;
     a->finger = -1;
@@ -873,6 +947,8 @@ static void jfa_buttons_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
 #define JFA_TURN_RATE 9.0f /* radians/second; smooth yaw toward input */
 #define JFA_PI 3.14159265358979323846f
 #define JFA_TWO_PI 6.28318530717958647692f
+static void jfa_clamp_to_arena(float pos[2], float xLimit,
+                               float zBack, float zFront);
 static void jfa_move_step(float pos[2], float *facing, float dx, float dz,
                           double dt, float xLimit, float zBack,
                           float zFront)
@@ -901,10 +977,31 @@ static void jfa_move_step(float pos[2], float *facing, float dx, float dz,
      pos[0] += dx * speed * (float)dt;
      pos[1] += dz * speed * (float)dt;
  }
+ jfa_clamp_to_arena(pos, xLimit, zBack, zFront);
+}
+/* Shared arena clamp: also used after fighter separation so a push can
+ * never leave the playable area. */
+static void jfa_clamp_to_arena(float pos[2], float xLimit,
+                               float zBack, float zFront)
+{
  if (pos[0] < -xLimit) pos[0] = -xLimit;
  if (pos[0] >  xLimit) pos[0] =  xLimit;
  if (pos[1] < zBack)   pos[1] = zBack;
  if (pos[1] > zFront)  pos[1] = zFront;
+}
+/* Keep two fighters from overlapping on the ground. Only the moved
+ * fighter (a) is adjusted; b stays put (the opponent is stationary).
+ * When already separated nothing changes. Exact overlap is resolved
+ * deterministically along +X to avoid a division by zero. */
+static void jfa_fighter_separate(float a[2], const float b[2], float minDist)
+{
+ float dx = a[0] - b[0], dz = a[1] - b[1];
+ float d2 = dx * dx + dz * dz;
+ if (d2 >= minDist * minDist) return;
+ if (d2 < 1e-8f) { dx = 1.0f; dz = 0.0f; d2 = 1.0f; }
+ float d = sqrtf(d2);
+ a[0] = b[0] + dx / d * minDist;
+ a[1] = b[1] + dz / d * minDist;
 }
 static int push(Mesh *m,Vertex v){
  if(m->count==m->cap){size_t n=m->cap?m->cap*2:4096;Vertex *p=(Vertex*)realloc(m->v,n*sizeof(Vertex));if(!p)return 0;m->v=p;m->cap=n;}m->v[m->count++]=v;return 1;
@@ -1110,7 +1207,7 @@ FBXModel fbx = {0};
 FBXMesh frameMesh = {0};
 int fbxOK = 0;
 GLuint tex = 0;
-GLuint meshVBO = 0, fpsVBO = 0;
+GLuint meshVBO[2] = { 0, 0 }, fpsVBO = 0;
 float groundY = 0.0f;
 float characterTopY = 0.0f;
 
@@ -1120,7 +1217,8 @@ float characterTopY = 0.0f;
 	jfaOK = jfa_load_all(&jfa, "animations", jerr, sizeof(jerr));
 	if (jfaOK) {
 		jfa_skin_setup(&jfa, 2.2f, &jfaScale, jfaCenter);
-		if (!jfa_skin_alloc(&jfaSkin, (size_t)jfa.nv)) {
+		if (!jfa_skin_alloc(&jfaSkin[0], (size_t)jfa.nv) ||
+		    !jfa_skin_alloc(&jfaSkin[1], (size_t)jfa.nv)) {
 			SDL_Log("JFA skin alloc failed - falling back to FBX");
 			jfa_free(&jfa);
 			jfaOK = 0;
@@ -1130,8 +1228,10 @@ float characterTopY = 0.0f;
 		/* UVs never change: fill them once here, not every frame
 		 * (same trick as the PSP loader). V is flipped for GLES. */
 		for (size_t i = 0; i < (size_t)jfa.nv; i++) {
-			jfaSkin.v[i].uv[0] = jfa.v[i].uv[0];
-			jfaSkin.v[i].uv[1] = 1.0f - jfa.v[i].uv[1];
+			jfaSkin[0].v[i].uv[0] = jfa.v[i].uv[0];
+			jfaSkin[0].v[i].uv[1] = 1.0f - jfa.v[i].uv[1];
+			jfaSkin[1].v[i].uv[0] = jfa.v[i].uv[0];
+			jfaSkin[1].v[i].uv[1] = 1.0f - jfa.v[i].uv[1];
 		}
 		/* posed local space: feet at y=0, height ~2.2 */
 		groundY = 0.0f;
@@ -1148,7 +1248,7 @@ if (!jfaOK) {
 	if (fbxOK) fbxOK = fbx_build_mesh(&fbx, 0.0, &frameMesh);
 }
 tex = loadBMP("model0.bmp");
-glGenBuffers(1, &meshVBO);
+glGenBuffers(2, meshVBO);
 glGenBuffers(1, &fpsVBO);
 GLuint dpadVBO = 0; /* M3.1-B: dedicated D-pad overlay VBO */
 glGenBuffers(1, &dpadVBO);
@@ -1179,7 +1279,7 @@ GLuint arenaWallsVBO = createArenaWalls(
 );
 
 if (!jfaOK && fbxOK && frameMesh.vertex_count > 0) {
-    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, meshVBO[0]);
     glBufferData(
         GL_ARRAY_BUFFER,
         frameMesh.vertex_count * sizeof(FBXVertex),
@@ -1187,14 +1287,18 @@ if (!jfaOK && fbxOK && frameMesh.vertex_count > 0) {
         GL_DYNAMIC_DRAW
     );
 } else if (jfaOK) {
-    /* Reserve the VBO once; every frame only calls glBufferSubData. */
-    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
-    glBufferData(
-        GL_ARRAY_BUFFER,
-        (size_t)jfa.nv * sizeof(JFASkinVertex),
-        NULL,
-        GL_DYNAMIC_DRAW
-    );
+    /* Reserve one skinned VBO per fighter; every frame only calls
+     * glBufferSubData. meshVBO[1] must also have a data store before
+     * the second fighter's first upload (GL_INVALID_OPERATION otherwise). */
+    for (int fi = 0; fi < 2; fi++) {
+        glBindBuffer(GL_ARRAY_BUFFER, meshVBO[fi]);
+        glBufferData(
+            GL_ARRAY_BUFFER,
+            (size_t)jfa.nv * sizeof(JFASkinVertex),
+            NULL,
+            GL_DYNAMIC_DRAW
+        );
+    }
 }
  GLint pos=glGetAttribLocation(prog,"aPosition"),uv=glGetAttribLocation(prog,"aUV"),normal=glGetAttribLocation(prog,"aNormal"),col=glGetAttribLocation(prog,"aColor");
  GLint mvpLoc=glGetUniformLocation(prog,"uMVP"),modelLoc=glGetUniformLocation(prog,"uModel"),texLoc=glGetUniformLocation(prog,"uTexture"),modeLoc=glGetUniformLocation(prog,"uTextMode");
@@ -1213,7 +1317,7 @@ int jfaGpuOK = 0;
 #if !JFA_GPU_RENDER
 static int jfaGpuAccN = 0;
 #endif
-static float jfaBoneStage[JFA_GPU_BONE_VECS * 4]; /* 99 vec4 staging */
+static float jfaBoneStage[2][JFA_GPU_BONE_VECS * 4]; /* 99 vec4 staging */
 /* Substage B: prepared static GPU vertex data. jfaGpuVerts stays NULL
  * on ANY preparation failure - that only disables the (not yet used)
  * GPU draw path later; the CPU renderer keeps rendering regardless. */
@@ -1361,17 +1465,14 @@ int run = 1;
 SDL_Event e;
 
 /* ---- M3.1-A: basic character movement (keyboard, development only).
- * charPos[0]/[1] are X/Z in the arena; Y stays 0 (grounded).
- * charFacing replaces the old static turntable angle ('angle'). ---- */
-static float charPos[2] = { 0.0f, 0.0f };
-static float charFacing = 0.0f;
+ * fighters[0] is the player; X/Z stay on the arena floor (Y = 0). ---- */
 static JFAButtons extraButtons;
 static Uint64 moveLastCounter = 0;
 static int moveTimeValid = 0;
 /* M3.1-B: one finger per D-pad button. Touch hit testing uses WINDOW
  * coordinates (SDL_GetWindowSize); rendering keeps drawable pixels. */
 static JFADpad dpad = { { -1, -1, -1, -1 } };
-static JFAAttack attack = { 0, JFA_IDLE, 0.0, 0.0, -1 };
+static JFAFighter fighters[2];   /* 0 = player, 1 = idle opponent */
 static int attackKeyPrev[3] = { 0, 0, 0 };  /* J/K/L edge tracking */
 static int inputW = 1080, inputH = 1920;
 
@@ -1381,6 +1482,21 @@ Uint64 animationStart = SDL_GetPerformanceCounter();
 int frames = 0, fps = 0;
 double freq = (double)SDL_GetPerformanceFrequency();
 jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
+/* Stage 2: both fighters start idle, healthy and inside the arena. */
+for (int fi = 0; fi < 2; fi++) {
+    fighters[fi].pos[0] = fighters[fi].pos[1] = 0.0f;
+    fighters[fi].facing = 0.0f;
+    fighters[fi].clip = JFA_IDLE;
+    fighters[fi].clipStart = 0.0;
+    fighters[fi].clipDur = 0.0;
+    fighters[fi].moveDx = fighters[fi].moveDz = 0.0f;
+    fighters[fi].sample.clip = JFA_IDLE;
+    fighters[fi].sample.time = 0.0;
+    jfa_health_init(&fighters[fi].health);
+    jfa_attack_reset(&fighters[fi].attack);
+}
+fighters[1].pos[0] = 1.5f;   /* opponent offset from the player */
+fighters[1].pos[1] = 0.5f;   /* inside the arena, clear of the front wall */
  while(run){
   {
     /* SDL finger coordinates are normalized over the WINDOW; keep
@@ -1396,20 +1512,20 @@ jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
     if (e.type == SDL_QUIT || e.type == SDL_APP_TERMINATING) {
         run = 0;
         jfa_dpad_reset(&dpad);
-        jfa_attack_reset(&attack);
+        jfa_attack_reset(&fighters[0].attack);
         jfa_buttons_reset(&extraButtons);
     } else if (e.type == SDL_APP_WILLENTERBACKGROUND ||
                e.type == SDL_APP_DIDENTERBACKGROUND) {
         /* No FINGERUP is guaranteed when Android backgrounds us. */
         jfa_dpad_reset(&dpad);
-        jfa_attack_reset(&attack);
+        jfa_attack_reset(&fighters[0].attack);
         jfa_buttons_reset(&extraButtons);
     }
 #if defined(SDL_FINGERCANCELLED)
     else if (e.type == SDL_FINGERCANCELLED) {
         /* Cancellation is per-finger: release only what that finger owns. */
         jfa_dpad_cancel(&dpad, e.tfinger.fingerId);
-        jfa_attack_release(&attack, e.tfinger.fingerId);
+        jfa_attack_release(&fighters[0].attack, e.tfinger.fingerId);
         jfa_buttons_up(&extraButtons, e.tfinger.fingerId);
     }
 #endif
@@ -1420,9 +1536,9 @@ jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
                                    inputW, inputH);
         if (btn >= 0) {
             double now = (SDL_GetPerformanceCounter() - animationStart) / freq;
-            if (jfa_face_button_press(&extraButtons, &attack, btn,
+            if (jfa_face_button_press(&extraButtons, &fighters[0].attack, btn,
                                       e.tfinger.fingerId, now,
-                                      now - jfaClipStart))
+                                      now - fighters[0].clipStart))
                 SDL_Log("JFA attack: finger=%lld clip=%s",
                         (long long)e.tfinger.fingerId,
                         jfa_clip_suffix[jfa_attack_clip_for_button(btn)]);
@@ -1467,7 +1583,7 @@ jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
     } else if (e.type == SDL_FINGERUP) {
         const unsigned before = jfa_dpad_visual_mask(&dpad);
         /* Releasing the attack finger does not cut the clip short. */
-        jfa_attack_release(&attack, e.tfinger.fingerId);
+        jfa_attack_release(&fighters[0].attack, e.tfinger.fingerId);
         jfa_buttons_up(&extraButtons, e.tfinger.fingerId);
         jfa_dpad_analog_release(&dpad, e.tfinger.fingerId);
         jfa_dpad_up(&dpad, e.tfinger.fingerId);
@@ -1493,8 +1609,8 @@ jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
             int clip = jfa_attack_clip_for_key(ki);
             int down = keys[keyScancode[ki]] ? 1 : 0;
             if (down && !attackKeyPrev[ki]) {
-                if (jfa_attack_trigger(&attack, animationTime,
-                                       animationTime - jfaClipStart, -1,
+                if (jfa_attack_trigger(&fighters[0].attack, animationTime,
+                                       animationTime - fighters[0].clipStart, -1,
                                        clip))
                     SDL_Log("JFA attack: key=%d clip=%s", ki,
                             jfa_clip_suffix[clip]);
@@ -1542,10 +1658,16 @@ jfa_buttons_reset(&extraButtons);   /* -1 = no finger owns each button */
         dx += dpad.analogX;
         dz += dpad.analogY;
     }
-    lastMoveDx = dx;
-    lastMoveDz = dz;
-    jfa_move_step(charPos, &charFacing, dx, dz, dt,
+    fighters[0].moveDx = dx;
+    fighters[0].moveDz = dz;
+    jfa_move_step(fighters[0].pos, &fighters[0].facing, dx, dz, dt,
                   xLimit, backZ, frontZ);
+    /* Collision after movement, then re-clamp: the player can slide
+     * around the stationary opponent but cannot walk through it.
+     * Renderer-independent (input path, outside all GPU #ifs). */
+    jfa_fighter_separate(fighters[0].pos, fighters[1].pos,
+                         JFA_FIGHTER_SEPARATION);
+    jfa_clamp_to_arena(fighters[0].pos, xLimit, backZ, frontZ);
   }
 
 if (!jfaOK) {
@@ -1558,7 +1680,7 @@ if (!jfaOK) {
 }
   int w,h;SDL_GL_GetDrawableSize(win,&w,&h);if(w<1)w=1;if(h<1)h=1;glViewport(0,0,w,h);glClearColor(.08f,.08f,.12f,1);glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
   if(tex && (jfaOK || (fbxOK && frameMesh.vertex_count > 0))){
-   float c=cosf(charFacing),s=sinf(charFacing);
+   float c=cosf(fighters[0].facing),s=sinf(fighters[0].facing);
    /* Fixed scene transform (also used for arena) is kept separate
     * from the character translation so the arena never moves. A small
     * +X pitch tilts the world up, i.e. the camera looks slightly down. */
@@ -1567,12 +1689,20 @@ if (!jfaOK) {
    float sceneMove[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,JFA_CAMERA_Y,JFA_CAMERA_Z,1};
    float sceneTrans[16];
    mm(sceneTrans, sceneMove, sceneRot);
-   float charTrans[16]={1,0,0,0,0,1,0,0,0,0,1,0,charPos[0],0.0f,charPos[1],1};
+   float charTrans[16]={1,0,0,0,0,1,0,0,0,0,1,0,fighters[0].pos[0],0.0f,fighters[0].pos[1],1};
    float model[16]={c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1};
    float charScene[16],vm[16],pr[16]={0},mvp[16];
    mm(charScene, sceneTrans, charTrans);
    mm(vm, charScene, model);
    float f=1.0f/tanf(1.047198f*0.5f),aspect=(float)w/h;pr[0]=f/aspect;pr[5]=f;pr[10]=-1.002f;pr[11]=-1;pr[14]=-.2002f;mm(mvp,pr,vm);
+   /* Stage 2: independent transform for the idle opponent. */
+   float c2=cosf(fighters[1].facing), s2=sinf(fighters[1].facing);
+   float charTrans2[16]={1,0,0,0,0,1,0,0,0,0,1,0,fighters[1].pos[0],0.0f,fighters[1].pos[1],1};
+   float model2[16]={c2,0,-s2,0,0,1,0,0,s2,0,c2,0,0,0,0,1};
+   float charScene2[16],vm2[16],mvp2[16];
+   mm(charScene2, sceneTrans, charTrans2);
+   mm(vm2, charScene2, model2);
+   mm(mvp2, pr, vm2);
    float identity[16] = {
     1,0,0,0,
     0,1,0,0,
@@ -1629,24 +1759,39 @@ glUseProgram(prog);glUniform1f(modeLoc,0);
 glDisableVertexAttribArray(col);
 glVertexAttrib3f(col, 1.0f, 1.0f, 1.0f);
    glUniformMatrix4fv(mvpLoc,1,GL_FALSE,mvp);glUniformMatrix4fv(modelLoc,1,GL_FALSE,model);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,tex);glUniform1i(texLoc,0);
-   glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
+   glBindBuffer(GL_ARRAY_BUFFER, meshVBO[0]);
 
 size_t drawCount = 0;
 const JFAClip *jfaCur = NULL;
-int sampleClip = jfaClip;   /* clip actually sampled this frame (attack or locomotion) */
+int sampleClip = fighters[0].clip;   /* clip actually sampled this frame (attack or locomotion) */
 int af = 0;
 const float worldPos[3] = { 0.0f, 0.0f, 0.0f };
 if (jfaOK) {
     /* ---- Animation advance (shared by CPU and GPU paths): the attack
      * state overrides the clip/frame, otherwise locomotion auto-cycles.
      * Both render paths consume sampleClip/af computed exactly here. ---- */
-    JFAAnimSample sample = jfa_anim_select(&attack, animationTime,
-                                           &jfaClip, &jfaClipStart,
-                                           jfa.clips, lastMoveDx, lastMoveDz);
+    JFAAnimSample sample = jfa_anim_select(&fighters[0].attack, animationTime,
+                                           &fighters[0].clip, &fighters[0].clipStart,
+                                           jfa.clips, fighters[0].moveDx, fighters[0].moveDz);
     sampleClip = sample.clip;
+    fighters[0].sample = sample;
     jfaCur = &jfa.clips[sampleClip];
-    jfaClipDur = (double)jfaCur->frames / (double)jfaCur->fps;
+    fighters[0].clipDur = (double)jfaCur->frames / (double)jfaCur->fps;
     af = jfa_skin_frame_index(jfaCur, sample.time);
+}
+/* Stage 2: the opponent owns its animation cursor and sample. */
+int oppClip = JFA_IDLE, oppAf = 0;
+if (jfaOK) {
+    fighters[1].sample = jfa_anim_select(&fighters[1].attack, animationTime,
+                                         &fighters[1].clip,
+                                         &fighters[1].clipStart,
+                                         jfa.clips,
+                                         fighters[1].moveDx,
+                                         fighters[1].moveDz);
+    const JFAClip *oc = &jfa.clips[fighters[1].sample.clip];
+    fighters[1].clipDur = (double)oc->frames / (double)oc->fps;
+    oppClip = fighters[1].sample.clip;
+    oppAf = jfa_skin_frame_index(oc, fighters[1].sample.time);
 }
 #if JFA_GPU_SKIN && JFA_GPU_RENDER
 int gpuDraw = 0;
@@ -1661,13 +1806,13 @@ if (jfaOK && jfaGpuRenderReady) {
     while (glGetError() != GL_NO_ERROR) {
     }
     jfa_gpu_fold(&jfa, sampleClip, af, jfaScale, jfaCenter, worldPos,
-        jfaBoneStage);
+        jfaBoneStage[0]);
     glUseProgram(jfaGpuProg);
     glUniformMatrix4fv(jfaGpuMvpLoc, 1, GL_FALSE, mvp);
     glUniformMatrix4fv(jfaGpuModelLoc, 1, GL_FALSE, model);
     glUniform1i(jfaGpuTexLoc, 0);
     glUniform1f(jfaGpuModeLoc, 0.0f);
-    glUniform4fv(jfaGpuBoneLoc, jfa.nb * 3, jfaBoneStage);
+    glUniform4fv(jfaGpuBoneLoc, jfa.nb * 3, jfaBoneStage[0]);
     glBindBuffer(GL_ARRAY_BUFFER, jfaGpuVbo);
     glEnableVertexAttribArray(jfaGpuPosLoc);
     glEnableVertexAttribArray(jfaGpuUvLoc);
@@ -1697,7 +1842,7 @@ if (jfaOK && jfaGpuRenderReady) {
     glDisableVertexAttribArray(jfaGpuBoneIdxLoc);
     glDisableVertexAttribArray(jfaGpuBoneWgtLoc);
     glUseProgram(prog); /* restore: FPS text renders with prog */
-    glBindBuffer(GL_ARRAY_BUFFER, meshVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, meshVBO[0]);
     {
         GLenum derr = glGetError();
         if (derr != GL_NO_ERROR) {
@@ -1722,14 +1867,14 @@ if (jfaOK) {
     /* ---- JFA: CPU skin the current clip frame, then one sub-data upload ---- */
     Uint64 tSkin0 = SDL_GetPerformanceCounter();
     jfa_skin_frame(&jfa, sampleClip, af, jfaScale, jfaCenter, worldPos,
-        &jfaSkin);
+        &jfaSkin[0]);
     Uint64 tSkin1 = SDL_GetPerformanceCounter();
 
     glBufferSubData(
         GL_ARRAY_BUFFER,
         0,
         (size_t)jfa.nv * sizeof(JFASkinVertex),
-        jfaSkin.v
+        jfaSkin[0].v
     );
     Uint64 tUpload1 = SDL_GetPerformanceCounter();
 
@@ -1754,9 +1899,9 @@ if (jfaOK) {
     if (jfaGpuOK) {
         Uint64 tFold0 = SDL_GetPerformanceCounter();
         jfa_gpu_fold(&jfa, sampleClip, af, jfaScale, jfaCenter, worldPos,
-            jfaBoneStage);
+            jfaBoneStage[0]);
         glUseProgram(jfaGpuProg);
-        glUniform4fv(jfaGpuBoneLoc, jfa.nb * 3, jfaBoneStage);
+        glUniform4fv(jfaGpuBoneLoc, jfa.nb * 3, jfaBoneStage[0]);
         glUseProgram(prog);
         if (++jfaGpuAccN == 60) {
             double ms = 1000.0 / (double)SDL_GetPerformanceFrequency();
@@ -1796,6 +1941,68 @@ glVertexAttribPointer(normal, 3, GL_FLOAT, GL_FALSE,
 
 glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
 }
+/* Stage 2: second fighter. Its own transform, pose sample, bone staging
+ * (GPU) or skinned buffer (CPU) are used; the shared immutable JFA mesh,
+ * shader and texture are reused without duplication. */
+if (jfaOK) {
+#if JFA_GPU_SKIN && JFA_GPU_RENDER
+if (jfaGpuRenderReady && gpuDraw) {
+    jfa_gpu_fold(&jfa, oppClip, oppAf, jfaScale, jfaCenter, worldPos,
+        jfaBoneStage[1]);
+    glUseProgram(jfaGpuProg);
+    glUniformMatrix4fv(jfaGpuMvpLoc, 1, GL_FALSE, mvp2);
+    glUniformMatrix4fv(jfaGpuModelLoc, 1, GL_FALSE, model2);
+    glUniform1i(jfaGpuTexLoc, 0);
+    glUniform1f(jfaGpuModeLoc, 0.0f);
+    glUniform4fv(jfaGpuBoneLoc, jfa.nb * 3, jfaBoneStage[1]);
+    glBindBuffer(GL_ARRAY_BUFFER, jfaGpuVbo);
+    glEnableVertexAttribArray(jfaGpuPosLoc);
+    glEnableVertexAttribArray(jfaGpuUvLoc);
+    glEnableVertexAttribArray(jfaGpuNrmLoc);
+    glEnableVertexAttribArray(jfaGpuBoneIdxLoc);
+    glEnableVertexAttribArray(jfaGpuBoneWgtLoc);
+    glVertexAttribPointer(jfaGpuPosLoc, 3, GL_FLOAT, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex), (void*)offsetof(JFAGpuVertex, position));
+    glVertexAttribPointer(jfaGpuUvLoc, 2, GL_FLOAT, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex), (void*)offsetof(JFAGpuVertex, uv));
+    glVertexAttribPointer(jfaGpuNrmLoc, 3, GL_FLOAT, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex), (void*)offsetof(JFAGpuVertex, normal));
+    glVertexAttribPointer(jfaGpuBoneIdxLoc, 4, GL_UNSIGNED_BYTE, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex), (void*)offsetof(JFAGpuVertex, bone));
+    glVertexAttribPointer(jfaGpuBoneWgtLoc, 4, GL_FLOAT, GL_FALSE,
+        (GLsizei)sizeof(JFAGpuVertex), (void*)offsetof(JFAGpuVertex, weight));
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)jfa.nv);
+    glDisableVertexAttribArray(jfaGpuBoneIdxLoc);
+    glDisableVertexAttribArray(jfaGpuBoneWgtLoc);
+    glUseProgram(prog);
+    glBindBuffer(GL_ARRAY_BUFFER, meshVBO[0]);
+} else
+#endif
+{
+    jfa_skin_frame(&jfa, oppClip, oppAf, jfaScale, jfaCenter, worldPos,
+        &jfaSkin[1]);
+    glBindBuffer(GL_ARRAY_BUFFER, meshVBO[1]);
+    glBufferSubData(GL_ARRAY_BUFFER, 0,
+        (size_t)jfa.nv * sizeof(JFASkinVertex), jfaSkin[1].v);
+    glUseProgram(prog);
+    glUniform1f(modeLoc, 0.0f);
+    glUniformMatrix4fv(mvpLoc, 1, GL_FALSE, mvp2);
+    glUniformMatrix4fv(modelLoc, 1, GL_FALSE, model2);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(texLoc, 0);
+    glEnableVertexAttribArray(pos);
+    glEnableVertexAttribArray(uv);
+    glEnableVertexAttribArray(normal);
+    glVertexAttribPointer(pos, 3, GL_FLOAT, GL_FALSE,
+        sizeof(JFASkinVertex), (void*)offsetof(JFASkinVertex, position));
+    glVertexAttribPointer(uv, 2, GL_FLOAT, GL_FALSE,
+        sizeof(JFASkinVertex), (void*)offsetof(JFASkinVertex, uv));
+    glVertexAttribPointer(normal, 3, GL_FLOAT, GL_FALSE,
+        sizeof(JFASkinVertex), (void*)offsetof(JFASkinVertex, normal));
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)jfa.nv);
+}
+}
   }
   frames++;Uint64 now=SDL_GetPerformanceCounter();if((double)(now-start)/freq>=.5){fps=(int)(frames*freq/(double)(now-start)+.5);frames=0;start=now;}
   drawFPS(prog,fpsVBO,pos,col,mvpLoc,modeLoc,w,h,fps);
@@ -1807,7 +2014,7 @@ glDrawArrays(GL_TRIANGLES, 0, (GLsizei)drawCount);
                    inputW, inputH, &extraButtons);
   SDL_GL_SwapWindow(win);
  }
- glDeleteBuffers(1, &meshVBO);
+ glDeleteBuffers(2, meshVBO);
 glDeleteBuffers(1, &fpsVBO);
 glDeleteBuffers(1, &dpadVBO);
 glDeleteBuffers(1, &buttonsVBO);
@@ -1819,7 +2026,8 @@ if (tex)
 glDeleteProgram(prog);
 
 if (jfaOK) {
-    jfa_skin_free(&jfaSkin);
+    jfa_skin_free(&jfaSkin[0]);
+    jfa_skin_free(&jfaSkin[1]);
     jfa_free(&jfa);
 }
 
