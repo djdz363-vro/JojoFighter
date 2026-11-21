@@ -465,6 +465,65 @@ typedef struct {
     JFAAttack attack;          /* player uses it; opponent starts inactive */
 } JFAFighter;
 
+/* ---- M3.3 Stage 3a: melee hit detection (pure math, renderer-free).
+ * Reach is measured center-to-center on the ground plane (X/Z). The cone
+ * uses a dot product, so it is continuous across the +/-PI facing seam.
+ * Both helpers take an attacker and a target, so future opponent AI can
+ * reuse the exact same code with the roles reversed. ---- */
+#define JFA_HIT_REACH 1.2f          /* center-to-center distance, X/Z */
+#define JFA_HIT_COS_HALF_CONE 0.5f  /* cos(60 deg) => 120 deg total */
+/* Tiny tolerance so a target exactly on the 60-degree edge is reliably
+ * inside despite float rounding of sinf/cosf (~0.0006 deg). */
+#define JFA_HIT_CONE_EPS 1e-5f
+#define JFA_HIT_DAMAGE 10
+#define JFA_HIT_WINDOW_START 0.30   /* fraction of the attack clip */
+#define JFA_HIT_WINDOW_END   0.70
+
+/* Only the middle 40% (30%..70%) of an active attack clip may strike.
+ * Uses the same elapsed-time representation as jfa_anim_select:
+ * elapsed = now - attack->start, duration = frames / fps. */
+static int jfa_attack_in_strike_window(const JFAAttack *a,
+                                       const JFAClip *clips, double now)
+{
+    double dur, elapsed;
+    if (!a || !a->active)
+        return 0;
+    dur = (double)clips[a->clip].frames / (double)clips[a->clip].fps;
+    if (dur <= 0.0)
+        return 0;
+    elapsed = now - a->start;
+    if (elapsed < 0.0 || elapsed >= dur)
+        return 0;
+    return elapsed >= JFA_HIT_WINDOW_START * dur &&
+           elapsed <= JFA_HIT_WINDOW_END * dur;
+}
+
+/* True when `attacker` has an active attack inside its strike window,
+ * `target` is within reach and inside the 120-degree facing cone.
+ * Near-zero distance is safe: there is no direction to test, so an
+ * overlapping target inside reach counts as a hit (no division). */
+static int jfa_attack_hits(const JFAFighter *attacker,
+                           const JFAFighter *target,
+                           const JFAClip *clips, double now)
+{
+    float dx, dz, d2, d, dot;
+    if (!attacker || !target)
+        return 0;
+    if (!jfa_attack_in_strike_window(&attacker->attack, clips, now))
+        return 0;
+    dx = target->pos[0] - attacker->pos[0];
+    dz = target->pos[1] - attacker->pos[1];
+    d2 = dx * dx + dz * dz;
+    if (d2 > JFA_HIT_REACH * JFA_HIT_REACH)
+        return 0;
+    if (d2 < 1e-8f)
+        return 1;               /* exact overlap: already inside reach */
+    d = sqrtf(d2);
+    /* Forward is (sin(facing), cos(facing)); no angle wrap needed. */
+    dot = (sinf(attacker->facing) * dx + cosf(attacker->facing) * dz) / d;
+    return dot >= JFA_HIT_COS_HALF_CONE - JFA_HIT_CONE_EPS;
+}
+
 static int jfa_attack_trigger(JFAAttack *a, double now,
                               double locoElapsed, SDL_FingerID finger,
                               int clip)
@@ -1792,6 +1851,17 @@ if (jfaOK) {
     fighters[1].clipDur = (double)oc->frames / (double)oc->fps;
     oppClip = fighters[1].sample.clip;
     oppAf = jfa_skin_frame_index(oc, fighters[1].sample.time);
+}
+/* ---- M3.3 Stage 3a: player -> opponent hit detection and damage.
+ * Runs after both fighters' animation sampling and outside every GPU
+ * conditional, so CPU and GPU builds share identical combat logic.
+ * hitApplied guarantees at most one damage per attack activation; a
+ * defeated target is skipped so it can never be damaged again. ---- */
+if (jfaOK && !jfa_health_defeated(&fighters[1].health) &&
+    jfa_attack_hits(&fighters[0], &fighters[1], jfa.clips, animationTime)) {
+    if (jfa_attack_try_damage(&fighters[0].attack, &fighters[1].health,
+                              JFA_HIT_DAMAGE))
+        SDL_Log("JFA hit: opponent hp=%d", fighters[1].health.health);
 }
 #if JFA_GPU_SKIN && JFA_GPU_RENDER
 int gpuDraw = 0;
