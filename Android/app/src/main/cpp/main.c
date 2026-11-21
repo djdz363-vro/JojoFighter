@@ -1003,12 +1003,17 @@ static void jfa_buttons_draw(GLuint prog, GLuint vbo, GLint pos, GLint col,
 /* ---- M3.1-A: one movement step (pure math, desktop-testable).
  * pos[0]/pos[1] are X/Z; Y is never touched (character stays grounded).
  * dt is clamped here so a long pause cannot teleport through a wall. */
-#define JFA_TURN_RATE 9.0f /* radians/second; smooth yaw toward input */
 #define JFA_PI 3.14159265358979323846f
 #define JFA_TWO_PI 6.28318530717958647692f
+#define JFA_FACE_TURN_RATE 5.0f /* radians/second; gentle look-at tracking */
 static void jfa_clamp_to_arena(float pos[2], float xLimit,
                                float zBack, float zFront);
-static void jfa_move_step(float pos[2], float *facing, float dx, float dz,
+static void jfa_move_step(float pos[2], float dx, float dz,
+                          double dt, float xLimit, float zBack,
+                          float zFront);
+static void jfa_face_target(float *facing, const float self[2],
+                            const float target[2], double dt);
+static void jfa_move_step(float pos[2], float dx, float dz,
                           double dt, float xLimit, float zBack,
                           float zFront)
 {
@@ -1019,24 +1024,52 @@ static void jfa_move_step(float pos[2], float *facing, float dx, float dz,
  if (dt > 0.05) dt = 0.05;
  len = sqrtf(dx * dx + dz * dz);
  if (len > 0.0f) {
-     float target, diff, maxStep;
      dx /= len;
      dz /= len;              /* diagonal is not faster than straight */
-     target = atan2f(dx, dz);
-     /* Shortest signed arc, correct across the -PI/PI seam. */
-     diff = atan2f(sinf(target - *facing), cosf(target - *facing));
-     maxStep = JFA_TURN_RATE * (float)dt;
-     if (diff > maxStep) diff = maxStep;
-     if (diff < -maxStep) diff = -maxStep;
-     *facing += diff;
-     /* Wrap into [-PI, PI] without unbounded accumulation. */
-     *facing = fmodf(*facing + JFA_PI, JFA_TWO_PI);
-     if (*facing < 0.0f) *facing += JFA_TWO_PI;
-     *facing -= JFA_PI;
      pos[0] += dx * speed * (float)dt;
      pos[1] += dz * speed * (float)dt;
  }
  jfa_clamp_to_arena(pos, xLimit, zBack, zFront);
+}
+/* ---- M3.3 Stage 3b-A: smooth opponent-facing, independent of movement.
+ * Rotates `facing` toward the target at a fixed angular speed (never a
+ * snap). Forward is (sin(facing), cos(facing)) -- the same convention as
+ * jfa_attack_hits() and the character model matrix. The shortest signed
+ * arc keeps the +/-PI seam continuous; the wrap matches the one the
+ * movement code used previously. ---- */
+static void jfa_face_target(float *facing, const float self[2],
+                            const float target[2], double dt)
+{
+    float dx, dz, desired, diff, maxStep;
+
+    if (!facing) return;
+    if (dt < 0.0) dt = 0.0;
+    if (dt > 0.05) dt = 0.05;   /* same clamp as movement: no teleport turns */
+    dx = target[0] - self[0];
+    dz = target[1] - self[1];
+    /* Exact overlap has no direction; keep the current facing. */
+    if (dx * dx + dz * dz < 1e-8f) return;
+    desired = atan2f(dx, dz);
+    diff = atan2f(sinf(desired - *facing), cosf(desired - *facing));
+    maxStep = JFA_FACE_TURN_RATE * (float)dt;
+    if (diff > maxStep) diff = maxStep;
+    if (diff < -maxStep) diff = -maxStep;
+    *facing += diff;
+    /* Wrap into [-PI, PI] without unbounded accumulation. */
+    *facing = fmodf(*facing + JFA_PI, JFA_TWO_PI);
+    if (*facing < 0.0f) *facing += JFA_TWO_PI;
+    *facing -= JFA_PI;
+}
+/* M3.3 Stage 3b-A: the per-frame facing guard for the player. Kept as a
+ * helper so the active-attack and defeated-target rules are testable in
+ * isolation. During an attack the facing captured at its start is held;
+ * once the opponent is defeated the last facing direction is retained. */
+static void jfa_face_update(JFAFighter *self, const JFAFighter *target,
+                            double dt)
+{
+    if (self->attack.active || jfa_health_defeated(&target->health))
+        return;
+    jfa_face_target(&self->facing, self->pos, target->pos, dt);
 }
 /* Shared arena clamp: also used after fighter separation so a push can
  * never leave the playable area. */
@@ -1719,14 +1752,19 @@ fighters[1].pos[1] = 0.5f;   /* inside the arena, clear of the front wall */
     }
     fighters[0].moveDx = dx;
     fighters[0].moveDz = dz;
-    jfa_move_step(fighters[0].pos, &fighters[0].facing, dx, dz, dt,
-                  xLimit, backZ, frontZ);
+    jfa_move_step(fighters[0].pos, dx, dz, dt, xLimit, backZ, frontZ);
     /* Collision after movement, then re-clamp: the player can slide
      * around the stationary opponent but cannot walk through it.
      * Renderer-independent (input path, outside all GPU #ifs). */
     jfa_fighter_separate(fighters[0].pos, fighters[1].pos,
                          JFA_FIGHTER_SEPARATION);
     jfa_clamp_to_arena(fighters[0].pos, xLimit, backZ, frontZ);
+    /* ---- M3.3 Stage 3b-A: face the opponent independently of movement.
+     * Runs after movement/collision and before model matrices are built,
+     * so CPU and GPU paths share the same updated facing. Held during an
+     * attack (keeps the facing captured at its start) and after the
+     * opponent is defeated (retains the last direction). ---- */
+    jfa_face_update(&fighters[0], &fighters[1], dt);
   }
 
 if (!jfaOK) {
