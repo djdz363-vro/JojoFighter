@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include "fbx_loader.h"
 #include "jfa_skin.h"
+#include "jfa_contact.h"
 #include "jfa_gpu.h"
 
 /* ------------------------------------------------------------------ */
@@ -393,6 +394,19 @@ typedef struct {
     double time;             /* seconds into that clip */
 } JFAAnimSample;
 
+/* ---- M3.3 Stage 3b-B: opponent hit reaction state. A reaction is a
+ * short clip (currently only the opponent's "hit" clip) that overrides
+ * LOCOMOTION sampling only. It owns an independent timer and clip
+ * index: the locomotion cursor (clip/clipStart/clipDur) and the attack
+ * timer are never touched, so the existing animation-selection state is
+ * exactly as it was and the pose returns to the same idle phase when
+ * the reaction ends. ---- */
+typedef struct {
+    int active;              /* 1 while the reaction clip is playing */
+    int clip;                /* clip index being played */
+    double start;            /* animationTime when the reaction began */
+} JFAReaction;
+
 /* ---- M3.3 Stage 1: health and damage foundation. Plain C state only;
  * no OpenGL, rendering, skinning, AI, hit detection or UI is involved. ---- */
 #define JFA_MAX_HEALTH 100
@@ -463,6 +477,7 @@ typedef struct {
     JFAAnimSample sample;      /* clip/frame selected this frame */
     JFAHealth health;          /* Stage 1 health, independent per fighter */
     JFAAttack attack;          /* player uses it; opponent starts inactive */
+    JFAReaction reaction;      /* Stage 3b-B: hit reaction (opponent only) */
 } JFAFighter;
 
 /* ---- M3.3 Stage 3a: melee hit detection (pure math, renderer-free).
@@ -476,24 +491,53 @@ typedef struct {
  * inside despite float rounding of sinf/cosf (~0.0006 deg). */
 #define JFA_HIT_CONE_EPS 1e-5f
 #define JFA_HIT_DAMAGE 10
-#define JFA_HIT_WINDOW_START 0.30   /* fraction of the attack clip */
+/* Phase B legacy fallback window, a fraction of the attack clip. It is used
+ * ONLY when the measured contact timing does not describe the clip's current
+ * data (see jfa_attack_has_contact_timing), so an unmeasured or re-baked
+ * asset still strikes instead of losing the ability to hit. */
+#define JFA_HIT_WINDOW_START 0.30
 #define JFA_HIT_WINDOW_END   0.70
 
-/* Only the middle 40% (30%..70%) of an active attack clip may strike.
- * Uses the same elapsed-time representation as jfa_anim_select:
- * elapsed = now - attack->start, duration = frames / fps. */
+/* 1 when this clip still has measured contact windows that describe its
+ * current frame count and fps (jfa_contact.c / Phase 0 measurements).
+ * 0 means the caller must fall back to the legacy fraction window. */
+static int jfa_attack_has_contact_timing(int clip, const JFAClip *clips)
+{
+    const JFAContactWindow *w;
+
+    if (!clips || clip < 0 || clip >= JFA_CLIP_COUNT)
+        return 0;
+    w = jfa_contact_window(clip, 0);
+    return w != NULL && jfa_contact_window_matches(w, &clips[clip]);
+}
+
+/* Phase B: an active attack may strike on the frames its striking limb is
+ * actually extended, measured in Phase 0 (docs/phase0-contact-measurements.txt)
+ * and queried through jfa_contact_frame_hits(). The query steps frames with
+ * the renderer's own jfa_skin_frame_index(), so "contact" means the frame
+ * that is on screen. Same elapsed-time representation as jfa_anim_select:
+ * elapsed = now - attack->start, duration = frames / fps.
+ *
+ * Everything else about the gate is unchanged: it still only permits a hit
+ * during the attack clip, and a hit still deals the same single damage event
+ * because jfa_attack_try_damage() keeps its one-hit-per-activation rule. */
 static int jfa_attack_in_strike_window(const JFAAttack *a,
                                        const JFAClip *clips, double now)
 {
     double dur, elapsed;
-    if (!a || !a->active)
+    if (!a || !a->active || !clips)
+        return 0;
+    if (a->clip < 0 || a->clip >= JFA_CLIP_COUNT)
+        return 0;               /* never index clip data out of range */
+    if (clips[a->clip].frames <= 0 || clips[a->clip].fps <= 0)
         return 0;
     dur = (double)clips[a->clip].frames / (double)clips[a->clip].fps;
-    if (dur <= 0.0)
-        return 0;
     elapsed = now - a->start;
     if (elapsed < 0.0 || elapsed >= dur)
         return 0;
+    if (jfa_attack_has_contact_timing(a->clip, clips))
+        return jfa_contact_frame_hits(a->clip, clips, elapsed);
+    /* Measured timing missing or stale for this clip: legacy fallback. */
     return elapsed >= JFA_HIT_WINDOW_START * dur &&
            elapsed <= JFA_HIT_WINDOW_END * dur;
 }
@@ -555,6 +599,82 @@ static void jfa_attack_reset(JFAAttack *a)
     a->start = 0.0;
     a->savedElapsed = 0.0;
     a->finger = -1;
+}
+
+/* ---- M3.3 Stage 3b-B: opponent hit reaction helpers. Invalid clip
+ * data (unknown index, frames <= 0, fps <= 0) can never start or keep a
+ * reaction alive: activation is refused, and an active reaction that
+ * becomes invalid is dropped on the next update instead of playing a
+ * stale frame forever. ---- */
+
+/* Duration of one clip in seconds; 0 for invalid clip data. The only
+ * place that divides by fps, so no caller can hit a division by zero. */
+static double jfa_clip_seconds(const JFAClip *c)
+{
+    if (!c || c->frames <= 0 || c->fps <= 0)
+        return 0.0;
+    return (double)c->frames / (double)c->fps;
+}
+
+/* Start (or restart) a reaction. Only an in-range clip index with a
+ * positive duration is accepted; on refusal the reaction state is left
+ * unchanged and 0 is returned. A new hit restarts an active reaction. */
+static int jfa_reaction_trigger(JFAReaction *r, double now, int clip,
+                                const JFAClip *clips)
+{
+    if (!r || !clips)
+        return 0;
+    if (clip < 0 || clip >= JFA_CLIP_COUNT)
+        return 0;
+    if (jfa_clip_seconds(&clips[clip]) <= 0.0)
+        return 0;
+    r->active = 1;
+    r->clip = clip;
+    r->start = now;
+    return 1;
+}
+
+/* Clear the reaction, leaving every field at a defined in-range value. */
+static void jfa_reaction_reset(JFAReaction *r)
+{
+    if (!r)
+        return;
+    r->active = 0;
+    r->clip = JFA_IDLE;
+    r->start = 0.0;
+}
+
+/* Fill `out` with the reaction clip/frame while it plays. Returns 1
+ * when the caller must use this sample and 0 when the reaction is over
+ * or invalid (clearing it in that case). */
+static int jfa_reaction_select(JFAReaction *r, double now,
+                               const JFAClip *clips, JFAAnimSample *out)
+{
+    double dur, elapsed;
+
+    if (!r || !out || !r->active)
+        return 0;
+    if (!clips || r->clip < 0 || r->clip >= JFA_CLIP_COUNT) {
+        jfa_reaction_reset(r);
+        return 0;
+    }
+    dur = jfa_clip_seconds(&clips[r->clip]);
+    if (dur <= 0.0) {
+        jfa_reaction_reset(r);
+        return 0;
+    }
+    elapsed = now - r->start;
+    /* A clock that went backwards must not produce a negative sample
+     * time (the frame index would go negative): hold frame 0. */
+    if (elapsed < 0.0)
+        elapsed = 0.0;
+    if (elapsed >= dur) {
+        jfa_reaction_reset(r);
+        return 0;
+    }
+    out->clip = r->clip;
+    out->time = elapsed;
+    return 1;
 }
 
 /* Pure clip selector. Mutates only the attack state and the locomotion
@@ -1586,6 +1706,7 @@ for (int fi = 0; fi < 2; fi++) {
     fighters[fi].sample.time = 0.0;
     jfa_health_init(&fighters[fi].health);
     jfa_attack_reset(&fighters[fi].attack);
+    jfa_reaction_reset(&fighters[fi].reaction);
 }
 fighters[1].pos[0] = 1.5f;   /* opponent offset from the player */
 fighters[1].pos[1] = 0.5f;   /* inside the arena, clear of the front wall */
@@ -1612,6 +1733,11 @@ fighters[1].pos[1] = 0.5f;   /* inside the arena, clear of the front wall */
         jfa_dpad_reset(&dpad);
         jfa_attack_reset(&fighters[0].attack);
         jfa_buttons_reset(&extraButtons);
+        /* M3.3 Stage 3b-B: animationTime keeps running while the app is
+         * backgrounded, so an in-flight reaction would expire unseen and
+         * resume as a stale pose. Clear it, like the attack state. */
+        for (int fi = 0; fi < 2; fi++)
+            jfa_reaction_reset(&fighters[fi].reaction);
     }
 #if defined(SDL_FINGERCANCELLED)
     else if (e.type == SDL_FINGERCANCELLED) {
@@ -1887,6 +2013,15 @@ if (jfaOK) {
                                          fighters[1].moveDz);
     const JFAClip *oc = &jfa.clips[fighters[1].sample.clip];
     fighters[1].clipDur = (double)oc->frames / (double)oc->fps;
+    /* ---- M3.3 Stage 3b-B: the hit reaction overrides LOCOMOTION only
+     * (a hypothetical attack would outrank it) and replaces the sampled
+     * clip/frame. The locomotion cursor advanced by jfa_anim_select()
+     * above is deliberately left untouched, so when the reaction ends
+     * the opponent continues the exact idle phase it would have had. */
+    if (!fighters[1].attack.active &&
+        jfa_reaction_select(&fighters[1].reaction, animationTime, jfa.clips,
+                            &fighters[1].sample))
+        oc = &jfa.clips[fighters[1].sample.clip];
     oppClip = fighters[1].sample.clip;
     oppAf = jfa_skin_frame_index(oc, fighters[1].sample.time);
 }
@@ -1898,8 +2033,16 @@ if (jfaOK) {
 if (jfaOK && !jfa_health_defeated(&fighters[1].health) &&
     jfa_attack_hits(&fighters[0], &fighters[1], jfa.clips, animationTime)) {
     if (jfa_attack_try_damage(&fighters[0].attack, &fighters[1].health,
-                              JFA_HIT_DAMAGE))
+                              JFA_HIT_DAMAGE)) {
+        /* M3.3 Stage 3b-B: react only to damage that was really applied.
+         * A new hit during a reaction restarts it. The final hit at 0 HP
+         * plays once and then returns to idle; knockdown/KO is 3b-C. */
+        if (jfa_reaction_trigger(&fighters[1].reaction, animationTime,
+                                 JFA_HIT, jfa.clips))
+            SDL_Log("JFA reaction: %s started",
+                    jfa_clip_suffix[JFA_HIT]);
         SDL_Log("JFA hit: opponent hp=%d", fighters[1].health.health);
+    }
 }
 #if JFA_GPU_SKIN && JFA_GPU_RENDER
 int gpuDraw = 0;

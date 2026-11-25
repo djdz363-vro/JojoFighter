@@ -15,6 +15,7 @@ LOCAL_SRC_FILES := \
     fbx_loader.c \
     jfa_loader.c \
     jfa_skin.c \
+    jfa_contact.c \
     jfa_gpu.c \
     ../ufbx/ufbx.c
 
