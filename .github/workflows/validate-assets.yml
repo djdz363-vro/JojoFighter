@@ -1,0 +1,30 @@
+name: Validate JFA Assets
+
+# Asset-pipeline check only. This does not build or ship a game.
+# Rebuilds tools/asset-pipeline/jfa_convert from source, runs --info on every
+# preserved JFA animation, re-bakes the idle clip from its FBX source and
+# compares it with the original file.
+
+on:
+  push:
+    paths:
+      - tools/asset-pipeline/**
+      - third_party/ufbx/**
+      - assets/characters/**
+      - .github/workflows/validate-assets.yml
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build JFA converter and validate re-bake against original
+        # Strict mode (byte-identical) is expected to fail: the available
+        # "Mma Idle.fbx" is a re-export of the original bake source, so the
+        # comparison runs with an explicit float tolerance (--tol 1e-3),
+        # see docs/legacy/JFA1.md for the quantified differences.
+        run: sh tools/asset-pipeline/validate_jfa.sh --tol 1e-3

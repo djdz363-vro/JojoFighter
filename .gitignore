@@ -1,0 +1,47 @@
+# ---- Build output and generated files ----
+build/
+out/
+dist/
+bin/
+obj/
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.elf
+*.prx
+EBOOT.PBP
+PARAM.SFO
+
+# Android / Gradle (if a future decision brings Android back)
+.gradle/
+local.properties
+*.apk
+*.aab
+*.aar
+*.ap_
+*.dex
+.cxx/
+.externalNativeBuild/
+
+# Asset-pipeline outputs (re-baked clips are written to build/jfa/)
+*.baked.jfa
+
+# ---- Caches and temporary files ----
+__pycache__/
+*.py[cod]
+*.tmp
+*.bak
+*.swp
+*~
+*.log
+
+# ---- Editor / OS files ----
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
