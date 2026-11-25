@@ -4,7 +4,7 @@
 
 This branch (`restart/jojo-fighters`) is the clean starting point for a complete rebuild. The previous implementations (a PSP homebrew build and an SDL2/OpenGL ES Android prototype written in C) have been removed from this branch. Only reusable assets, asset-processing tools, licenses and reference documentation were kept.
 
-**There is no game code in this branch yet.** No engine, language or target platform has been finalized in the repository. Those decisions must be agreed and documented in [`docs/architecture/`](docs/architecture/) before gameplay code is written. The durable project handoff is [`docs/PROJECT_CONTEXT.md`](docs/PROJECT_CONTEXT.md).
+**There is no game code in this branch yet.** The confirmed platform order is **Android first, PC later**. The engine/framework, programming language and animation pipeline are not yet finalized; those decisions must be agreed and documented in [`docs/architecture/`](docs/architecture/) before gameplay code is written. The durable project handoff is [`docs/PROJECT_CONTEXT.md`](docs/PROJECT_CONTEXT.md).
 
 ## Repository layout
 
@@ -47,4 +47,4 @@ This rebuilds the JFA converter, prints information for every preserved animatio
 
 ## Next steps
 
-See [`docs/REBUILD_PLAN.md`](docs/REBUILD_PLAN.md). Do not begin gameplay implementation until the platform, engine/language and animation pipeline decisions are agreed and recorded.
+See [`docs/REBUILD_PLAN.md`](docs/REBUILD_PLAN.md). Do not begin gameplay implementation until the engine/language and animation pipeline decisions are agreed and recorded.
