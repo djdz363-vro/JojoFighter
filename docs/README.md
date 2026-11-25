@@ -4,6 +4,7 @@
 |----------|---------|
 | [ASSET_INVENTORY.md](ASSET_INVENTORY.md) | Every preserved asset, its origin path and what it is |
 | [REBUILD_PLAN.md](REBUILD_PLAN.md) | Starting point, decisions still open, and the order of work for the remake |
+| [CI.md](CI.md) | GitHub Actions workflows, which are active/disabled, and why |
 | [architecture/](architecture/) | New architecture decisions (empty until the design is agreed) |
 | [legacy/](legacy/) | Reference material carried over from the old prototype |
 

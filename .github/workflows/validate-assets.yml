@@ -7,6 +7,10 @@ name: Validate JFA Assets
 
 on:
   push:
+    # Branch pushes only. Listing `branches` without `tags` means tag pushes
+    # (e.g. archive/* safety tags) never start this workflow.
+    branches:
+      - '**'
     paths:
       - tools/asset-pipeline/**
       - third_party/ufbx/**

@@ -71,7 +71,7 @@ stages and UI procedurally in code. These must be sourced or created for the rem
 | `tools/asset-pipeline/validate_jfa.sh` | Builds the converter, checks every clip, re-bakes idle and compares |
 | `tools/asset-pipeline/inspect_fbx.c` | Prints animation duration and sample skinned vertices of `Mma Idle.fbx` |
 | `third_party/ufbx/` | ufbx FBX loader (MIT / public domain), used by the tools above |
-| `.github/workflows/validate-assets.yml` | Runs `validate_jfa.sh` in CI when assets or tools change |
+| `.github/workflows/validate-assets.yml` | Runs `validate_jfa.sh` in CI on branch pushes that change assets or tools (see [CI.md](CI.md)) |
 
 ## Intentionally not kept
 
