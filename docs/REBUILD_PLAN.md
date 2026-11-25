@@ -5,7 +5,8 @@
 ## Starting point (2026-11-25)
 
 - Active rebuild branch: `restart/jojo-fighters`, created from the former `main` history (`eeb4482`).
-- No game code, engine, build system or target platform is present on the active rebuild branch.
+- Confirmed platform order: **Android first, PC later**.
+- No game code, engine, programming language or build system is present on the active rebuild branch.
 - Preserved: 3 character meshes with textures, 2 FBX sources and 10 baked animation clips for model0 ([ASSET_INVENTORY.md](ASSET_INVENTORY.md)), a working FBX → JFA1 asset pipeline, and the legacy reference docs in [legacy/](legacy/).
 - Historical implementations are recoverable from the `archive/*` tags (see the root README).
 
@@ -20,18 +21,17 @@ Lessons worth carrying over are recorded in [legacy/BUGS_AND_ERRORS.md](legacy/B
 
 These must be decided and recorded in [architecture/](architecture/) before writing game code:
 
-1. Target platforms (Android first with PC later is under discussion; it is not yet recorded here as a final architecture decision).
-2. Engine or framework, and implementation language.
-3. Whether the JFA1 format stays as the runtime animation format, or the FBX sources are imported directly / re-exported to another format (glTF, …). Nine of the ten clips have no FBX source in the repository; their original Mixamo sources would need to be re-downloaded if JFA1 is dropped.
-4. Scale convention (model2 is in centimetres, model0/model1 in metres) and whether model1/model2 will be rigged.
-5. Combat model: frame data, hitbox/hurtbox representation, input buffering. [legacy/phase0-contact-measurements.txt](legacy/phase0-contact-measurements.txt) gives measured active frames and reach for the existing attack clips.
-6. Source of audio, stage, UI and font assets (none exist yet).
-7. Licensing of the project itself and of the character assets (see [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)).
+1. Engine or framework, and implementation language, selected for Android-first development with PC later.
+2. Whether the JFA1 format stays as the runtime animation format, or the FBX sources are imported directly / re-exported to another format (glTF, …). Nine of the ten clips have no FBX source in the repository; their original Mixamo sources would need to be re-downloaded if JFA1 is dropped.
+3. Scale convention (model2 is in centimetres, model0/model1 in metres) and whether model1/model2 will be rigged.
+4. Combat model: frame data, hitbox/hurtbox representation, input buffering. [legacy/phase0-contact-measurements.txt](legacy/phase0-contact-measurements.txt) gives measured active frames and reach for the existing attack clips.
+5. Source of audio, stage, UI and font assets (none exist yet).
+6. Licensing of the project itself and of the character assets (see [../THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)).
 
 ## Suggested order of work
 
-1. Settle target platform, engine/language and animation asset strategy; write architecture decision records.
-2. Add the chosen engine/toolchain and a minimal empty project that builds.
+1. Settle the engine/framework, language and animation asset strategy; write architecture decision records.
+2. Add the chosen engine/toolchain and a minimal empty project that builds for Android.
 3. Import the preserved assets into the new pipeline and verify one character renders and plays every available clip.
 4. Only then start gameplay: movement, then attacks, then hit detection, using the measured contact data as a starting point.
 5. Resolve the items in [../migration-review/](../migration-review/).
