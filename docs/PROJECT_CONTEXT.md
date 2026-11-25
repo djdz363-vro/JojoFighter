@@ -8,7 +8,7 @@
 ## 1. Project identity
 
 - **Current project name:** JOJO: The Last Stand.
-- **Former name:** JoJo Fighters (used in historical commits, tags, and some existing documentation).
+- **Former name:** JoJo Fighters (used in historical commits, tags, and legacy documentation).
 - **GitHub repository:** `djdz363-vro/JojoFighter`.
 - **Active rebuild branch:** `restart/jojo-fighters`.
 - Use **JOJO: The Last Stand** in new documentation, discussion, and user-facing project material. Do not rename the GitHub repository unless the owner explicitly requests it.
@@ -17,10 +17,11 @@
 
 This is a clean restart, not a continuation of the old playable prototype.
 
-- The active branch contains no game implementation, selected engine, selected programming language, build system, or confirmed target platform.
+- The active branch contains no game implementation, selected engine, selected programming language, or game build system.
+- **Confirmed platform order: Android first, PC later.**
 - The branch preserves reusable character assets, animation data, asset-processing tools, licenses, and reference documentation.
 - The root `README.md` and `docs/REBUILD_PLAN.md` describe the repository layout and rebuild starting point.
-- `docs/architecture/README.md` confirms that architecture decisions have not yet been made.
+- `docs/architecture/README.md` confirms that engine and architecture decisions have not yet been made.
 - Do not assume that a previous prototype's technology choices automatically apply to the remake.
 
 ### Preserved material
@@ -51,13 +52,12 @@ Use these implementations as reference material when useful, not as authority fo
 
 The following decisions are not settled. Do not silently choose them or begin gameplay implementation before documenting the relevant decisions.
 
-1. **Target platforms:** for example Android, PC, PSP, or web.
-2. **Engine/framework and language:** select based on target platforms, project scope, maintainability, and available tooling.
-3. **Animation/runtime asset pipeline:** decide whether JFA1 remains the runtime format, or whether FBX sources are imported/re-exported to another format such as glTF. Account for the missing source FBX files for nine clips.
-4. **Character scale and rigging:** the rebuild plan notes model2 is in centimetres while model0/model1 are in metres; determine a consistent convention and whether model1/model2 will be rigged.
-5. **Combat architecture:** frame data, hitbox/hurtbox representation, input buffering, attack priority, hit reactions, knockdown, and other combat rules.
-6. **Audio, stage, UI, and fonts:** no such new-project assets are currently present.
-7. **Licensing:** determine project licensing and confirm permissible use/redistribution of character assets. Consult `THIRD_PARTY_NOTICES.md`.
+1. **Engine/framework and language:** select based on Android-first development, later PC support, project scope, maintainability, and available tooling.
+2. **Animation/runtime asset pipeline:** decide whether JFA1 remains the runtime format, or whether FBX sources are imported/re-exported to another format such as glTF. Account for the missing source FBX files for nine clips.
+3. **Character scale and rigging:** the rebuild plan notes model2 is in centimetres while model0/model1 are in metres; determine a consistent convention and whether model1/model2 will be rigged.
+4. **Combat architecture:** frame data, hitbox/hurtbox representation, input buffering, attack priority, hit reactions, knockdown, and other combat rules.
+5. **Audio, stage, UI, and fonts:** no such new-project assets are currently present.
+6. **Licensing:** determine project licensing and confirm permissible use/redistribution of character assets. Consult `THIRD_PARTY_NOTICES.md`.
 
 Record consequential choices as short architecture decision records in `docs/architecture/`, using the suggested `NNNN-title.md` format: context, options considered, decision, and consequences.
 
@@ -65,8 +65,8 @@ Record consequential choices as short architecture decision records in `docs/arc
 
 Follow the rebuild plan unless the owner explicitly changes priorities:
 
-1. Decide target platforms, engine/language, and animation asset strategy; document the decisions.
-2. Add the chosen engine/toolchain and establish a minimal empty project that builds.
+1. Select the engine/framework, language, and animation asset strategy; document the decisions.
+2. Add the chosen engine/toolchain and establish a minimal Android project that builds.
 3. Import preserved assets and verify that one character renders and plays every available clip.
 4. Implement gameplay incrementally: movement, attacks, then hit detection. Use the measured contact data in `docs/legacy/phase0-contact-measurements.txt` as reference, not as unquestionable final design.
 5. Review and resolve the files in `migration-review/`.
