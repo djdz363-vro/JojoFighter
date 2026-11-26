@@ -69,3 +69,46 @@ These must be decided and recorded in [architecture/](architecture/) before writ
 4. Import the preserved assets into the new pipeline and verify one character renders and plays every available clip.
 5. Only then start gameplay: movement, then attacks, then hit detection, using the measured contact data as a starting point.
 6. Resolve the items in [../migration-review/](../migration-review/).
+
+## Standard milestone workflow: Planning → Making
+
+This two-phase process applies to every milestone throughout the rebuild. We complete one milestone, review its result together, and then plan the next milestone in detail.
+
+### Phase 1 — Planning
+
+Before implementation begins, discuss and agree on:
+
+1. The milestone's objective and boundaries (what is included and what is deliberately postponed).
+2. Expected gameplay behaviour and user experience.
+3. Technical approach, dependencies and relevant alternatives.
+4. Risks, compatibility concerns and any required asset preparation.
+5. Acceptance criteria: exactly how we will know the milestone works.
+6. The implementation instructions and checks to be given to FreeBuff.
+
+The plan is not ready for implementation until the user has reviewed and approved it. Update this rebuild plan when a decision is confirmed; keep proposals clearly labelled as proposals until approved.
+
+### Phase 2 — Making
+
+After the milestone plan is approved:
+
+1. FreeBuff implements only the agreed scope. It must not independently change the architecture, replace assets or expand the scope.
+2. Run the checks and tests defined during planning, and report what changed and what passed or failed.
+3. Review the implementation against the acceptance criteria.
+4. The user tests on the target device when practical (Android testing is especially important).
+5. Fix any failures and repeat the relevant checks.
+6. Accept the milestone only when its agreed criteria are met.
+
+A milestone is not complete merely because implementation or automated checks finished; the result must be reviewed and, where appropriate, tested by the user.
+
+### Transition between milestones
+
+After a milestone is accepted, return to Phase 1 and discuss the next milestone in detail. Do not begin its implementation just because it appears in a roadmap. Dependencies may be discussed earlier, but the next milestone still needs its own agreed plan before work starts.
+
+### Working and Git safety rules
+
+- ChatGPT acts as the planning, explanation and review partner; FreeBuff is the implementation assistant; GitHub is the canonical source repository; the user remains the project owner and final decision-maker.
+- Explain unfamiliar technical concepts and proceed one step at a time. Do not assume the user already knows Godot or programming.
+- Do not make unapproved code, asset or architecture changes.
+- Do not commit or push until the user explicitly approves the proposed Git operation.
+- Building or delivering an APK is not a mandatory handoff step. Arrange Android builds and installs when they are useful for the agreed test, without adding an unnecessary APK-delivery step.
+
